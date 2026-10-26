@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    EasyUtau의 엔진. 사용자가 깔아 둔 OpenUtau(Mac: /Applications/OpenUtau.app)의 OpenUtau.Core를 그대로 써서
+    프로젝트를 열고 · 고치고 · 저장하고 · 재생한다. OpenUtau 프로그램 폴더 복사본에서 OpenUtau.dll 자리에 놓고 돌린다
+    (앱의 EngineHost.swift가 준비한다).
+
+    만들기: dotnet build -c Release -p:OpenUtauDir=/Applications/OpenUtau.app/Contents/MacOS
+    OpenUtauDir의 dll은 참조만 하고 결과에 넣지 않는다 (실행할 때 사용자 OpenUtau의 것을 쓴다).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>EasyUtauEngine</AssemblyName>
+    <RootNamespace>EasyUtau.Engine</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <SatelliteResourceLanguages>none</SatelliteResourceLanguages>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SelfContained>false</SelfContained>
+    <UseAppHost>false</UseAppHost>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <OpenUtauDir Condition="'$(OpenUtauDir)' == ''">/Applications/OpenUtau.app/Contents/MacOS</OpenUtauDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="OpenUtau.Core">
+      <HintPath>$(OpenUtauDir)/OpenUtau.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NAudio.Core">
+      <HintPath>$(OpenUtauDir)/NAudio.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Serilog">
+      <HintPath>$(OpenUtauDir)/Serilog.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
