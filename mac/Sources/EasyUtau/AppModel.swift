@@ -360,7 +360,10 @@ final class AppModel: ObservableObject {
                 return
             }
             NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: app,
-                                    configuration: NSWorkspace.OpenConfiguration())
+                                    configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                guard error != nil else { return }
+                Task { @MainActor in self.show("OpenUtau를 열지 못했어요", success: false) }
+            }
         }
     }
 
