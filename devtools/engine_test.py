@@ -70,6 +70,22 @@ class Engine:
                 self.lock.wait(0.2)
         raise TimeoutError(f"{name} 알림이 오지 않았어요")
 
+    def wait_phonemes(self, part, timeout=90):
+        """그 파트의 음소가 다 맞을 때까지 (발음 방식이 바뀌면 엔진이 다시 맞춘다). 마지막 결과."""
+        end = time.time() + timeout
+        last = None
+        with self.lock:
+            while time.time() < end:
+                got = [e for e in self.events if e["event"] == "phonemized" and e.get("part") == part]
+                if got:
+                    last = got[-1]
+                    if not any(p["error"] for p in last["phonemes"]):
+                        break
+                self.lock.wait(0.2)
+        if last is None:
+            raise TimeoutError("phonemized 알림이 오지 않았어요")
+        return last
+
     def send(self, cmd, timeout=180, **args):
         self.id += 1
         msg = dict(args)
@@ -160,14 +176,17 @@ def main():
         # 엔진이 기본 음 넘어가기(포르타멘토) 점을 채워 줬는지
         assert got[0]["pitch"]["data"], "기본 피치 점이 없어요"
         print(f"섹터 {len(got)}개 넣음, 기본 피치 점 {len(got[0]['pitch']['data'])}개")
+        if reply.get("notice"):
+            print("엔진 알림:", reply["notice"])
+        result["phonemizer"] = reply["project"]["tracks"][0]["phonemizerName"]
 
-        ev = e.wait_event("phonemized", timeout=180, where=lambda x: x.get("part") == part["index"])
-        phonemes = ev["phonemes"]
+        phonemes = e.wait_phonemes(part["index"], timeout=180)["phonemes"]
         errors = [p for p in phonemes if p["error"]]
-        print(f"발음 {len(phonemes)}개, 음원에 없는 소리 {len(errors)}개: "
+        print(f"발음 {len(phonemes)}개 ({result['phonemizer']}), 음원에 없는 소리 {len(errors)}개: "
               + " ".join(p["phoneme"] for p in phonemes[:12]))
         result["phonemes"] = len(phonemes)
         result["phoneme_errors"] = len(errors)
+        assert not errors, "음원에 없는 소리가 있어요 (이대로면 그 섹터는 소리가 안 나요)"
 
         # 음 높이 곡선 · 떨림 · 발음 바꾸기
         xs = list(range(made[2]["position"], made[3]["position"], 5))

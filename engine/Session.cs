@@ -553,11 +553,43 @@ namespace EasyUtau.Engine {
                 needed = Math.Max(needed, Project.timeAxis.BarBeatToTickPos(bar + 2, 0) - part.position);
             }
             part.Duration = Math.Max(part.Duration, needed);
-            Edit(Str(req, "label") ?? "command.note.edit", () => DocManager.Inst.ExecuteCmd(new ReplacePartCommand(Project, old, part)));
+            string switched = null;
+            Edit(Str(req, "label") ?? "command.note.edit", () => {
+                DocManager.Inst.ExecuteCmd(new ReplacePartCommand(Project, old, part));
+                switched = KoreanOnJapanese(track, part);
+            });
             var result = ProjectJson();
             result["part"] = Json.Part(Project, index);
+            if (switched != null) {
+                result["notice"] = $"한글 가사라서 발음 방식을 \"{switched}\" (한국어를 일본어 음원으로)로 바꿨어요";
+            }
             return result;
         }
+
+        const string KoToJa = "OpenUtau.Plugin.Builtin.KOtoJAPhonemizer";
+
+        /// <summary>일본어 UTAU 음원(테토 등)에 한글 가사를 쓰면 OpenUtau의 "KO to JA" 발음 방식으로 바꾼다
+        /// (AutoTuner와 같은 방식). 그대로 두면 음원에 없는 소리라 아무 소리도 안 난다. 바꿨으면 그 이름.</summary>
+        string KoreanOnJapanese(UTrack track, UVoicePart part) {
+            if (track.Singer is not { Found: true, SingerType: USingerType.Classic } singer
+                || !part.notes.Any(n => HasHangul(n.lyric))) {
+                return null;
+            }
+            var current = track.Phonemizer == null ? null : PhonemizerFactory.Get(track.Phonemizer.GetType());
+            if (current?.language == "KO" || track.Phonemizer?.GetType().FullName == KoToJa) {
+                return null;
+            }
+            bool japanese = current?.language == "JA"
+                || (singer.Otos?.Any(o => o.Alias != null && o.Alias.Any(c => c >= '\u3041' && c <= '\u3096')) ?? false);
+            var factory = japanese ? PhonemizerFactory.Get(KoToJa) : null;
+            if (factory == null) {
+                return null;
+            }
+            DocManager.Inst.ExecuteCmd(new TrackChangePhonemizerCommand(Project, track, factory.Create()));
+            return factory.name;
+        }
+
+        static bool HasHangul(string text) => text != null && text.Any(c => c >= '\uAC00' && c <= '\uD7A3');
 
         JsonObject AddTrack(JsonObject req) {
             var track = new UTrack(Project) { TrackNo = Project.tracks.Count };

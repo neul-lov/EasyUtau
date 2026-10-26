@@ -160,6 +160,8 @@ final class AppModel: ObservableObject {
         if let editor, !p.parts.indices.contains(editor.partIndex) || !p.parts[editor.partIndex].isVoice {
             closeEditor()
         }
+        // 엔진이 알아서 바꾼 것 (예: 한글 가사 → 발음 방식)
+        if let notice = reply["notice"] as? String, !notice.isEmpty { show(notice) }
     }
 
     var isReady: Bool { engineState == .ready }
