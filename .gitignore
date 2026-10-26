@@ -1,0 +1,10 @@
+.DS_Store
+mac/.build/
+mac/build/
+engine/bin/
+engine/obj/
+out/
+OpenUtau.app/
+host/
+*.zip
+*.dmg
