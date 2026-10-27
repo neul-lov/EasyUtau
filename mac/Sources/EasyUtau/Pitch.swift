@@ -118,38 +118,6 @@ enum PitchMath {
     private static func vibratoValue(_ v: VibratoData, _ nPos: Double, _ nPeriod: Double) -> Double {
         vibrato(v, nPos: nPos, nPeriod: nPeriod)
     }
-
-    /// 펜으로 그릴 때 기준이 되는 높이 (OpenUtau NotesViewModelHitTest.SamplePitch와 같은 식): 센트.
-    static func drawBase(_ notes: [NoteData], axis: TimeAxis, partPosition: Int, tick: Double, defaults: EngineDefaults) -> Double? {
-        guard !notes.isEmpty else { return nil }
-        let k = notes.firstIndex { Double($0.end) >= tick } ?? notes.count - 1
-        let n = notes[k]
-        var pitch = Double(n.tone * 100 + n.tuning)
-        pitch += sample(notes, k, axis: axis, partPosition: partPosition, tick: tick, defaults: defaults) ?? 0
-        if k + 1 < notes.count, notes[k + 1].position == n.end,
-           let delta = sample(notes, k + 1, axis: axis, partPosition: partPosition, tick: tick, defaults: defaults) {
-            pitch += delta + Double((notes[k + 1].tone - n.tone) * 100 + notes[k + 1].tuning - n.tuning)
-        }
-        return pitch
-    }
-
-    /// UPitch.Sample: 음표 k의 피치 점이 그 틱에서 만드는 값 (센트, 음표 높이 기준).
-    static func sample(_ notes: [NoteData], _ k: Int, axis: TimeAxis, partPosition: Int, tick: Double, defaults: EngineDefaults) -> Double? {
-        let n = notes[k]
-        let data = snapped(notes, k, defaults: defaults)
-        guard let first = data.first, let last = data.last else { return nil }
-        let posMs = axis.ms(Double(partPosition + n.position))
-        func t(_ p: PitchPointData) -> Double { (axis.tick(ms: posMs + p.x) - Double(partPosition)).rounded() }
-        for i in 0..<(data.count - 1) {
-            let t1 = t(data[i]), t2 = t(data[i + 1])
-            if t1 <= tick && tick <= t2 {
-                return interpolate(t1, t2, data[i].y, data[i + 1].y, tick, data[i].shape) * 10
-            }
-        }
-        if tick < t(first) { return first.y * 10 }
-        if tick > t(last) { return last.y * 10 }
-        return nil
-    }
 }
 
 /// 곡선 (PITD 등): OpenUtau UCurve와 같은 저장 방식 (5틱 간격 점, 사이는 직선).
@@ -199,29 +167,6 @@ enum CurveMath {
         let keep = c.xs.indices.filter { !(c.xs[$0] > x1 && c.xs[$0] < x2) }
         c.xs = keep.map { c.xs[$0] }
         c.ys = keep.map { c.ys[$0] }
-    }
-
-    /// UCurve.Set: 지난 점(lastX, lastY)에서 (x, y)까지 그은 선.
-    static func set(_ c: inout CurveData, x x0: Int, y: Int, lastX lastX0: Int, lastY: Int, defaultValue: Int = 0) {
-        let x = snap(Double(x0)), lastX = snap(Double(lastX0))
-        if x == lastX {
-            let leftY = sample(c, x - interval, defaultValue: defaultValue)
-            let rightY = sample(c, x + interval, defaultValue: defaultValue)
-            insert(&c, x - interval, leftY)
-            insert(&c, x, y)
-            insert(&c, x + interval, rightY)
-        } else if x < lastX {
-            let leftY = sample(c, x - interval, defaultValue: defaultValue)
-            deleteBetweenExclusive(&c, x, lastX)
-            insert(&c, x - interval, leftY)
-            insert(&c, x, y)
-        } else {
-            let rightY = sample(c, x + interval, defaultValue: defaultValue)
-            deleteBetweenExclusive(&c, lastX, x)
-            insert(&c, x, y)
-            insert(&c, x + interval, rightY)
-        }
-        _ = lastY
     }
 
     /// [a, b] 구간을 기본값으로 (지우개 · 초기화). 양끝 밖은 그대로.
@@ -275,5 +220,202 @@ enum CurveMath {
         c.ys = ys
         // 전부 기본값이면 비운다
         if c.ys.allSatisfy({ $0 == defaultValue }) { c.xs = []; c.ys = [] }
+    }
+}
+
+extension CurveMath {
+    /// [a, b] 구간을 points로 바꾼다. 구간 바로 밖 점은 원래 값을 남겨서 밖은 그대로.
+    static func replace(_ c: inout CurveData, from a: Int, to b: Int, with points: [(x: Int, y: Int)], defaultValue: Int = 0) {
+        let lo = snap(Double(min(a, b))), hi = snap(Double(max(a, b)))
+        let left = sample(c, lo - interval, defaultValue: defaultValue)
+        let right = sample(c, hi + interval, defaultValue: defaultValue)
+        deleteBetweenExclusive(&c, lo - interval, hi + interval)
+        insert(&c, lo - interval, left)
+        for p in points where p.x >= lo && p.x <= hi { insert(&c, p.x, p.y) }
+        insert(&c, hi + interval, right)
+        cleanup(&c, defaultValue: defaultValue)
+    }
+
+    /// 지우개: [a, b]는 기본값으로, 양쪽 ramp 틱은 원래 값에서 부드럽게 줄여 간다 (소리가 툭 끊기지 않게).
+    static func fade(_ c: inout CurveData, from a: Int, to b: Int, ramp: Int, defaultValue: Int = 0) {
+        let lo = snap(Double(min(a, b))), hi = snap(Double(max(a, b)))
+        var points: [(x: Int, y: Int)] = []
+        var x = lo - ramp
+        while x <= hi + ramp {
+            var w = 1.0
+            if x < lo { w = PitchSketch.ease(Double(x - (lo - ramp)) / Double(max(1, ramp))) }
+            if x > hi { w = PitchSketch.ease(Double(hi + ramp - x) / Double(max(1, ramp))) }
+            let old = Double(sample(c, x, defaultValue: defaultValue))
+            points.append((x, Int((old + (Double(defaultValue) - old) * w).rounded())))
+            x += interval
+        }
+        replace(&c, from: lo - ramp, to: hi + ramp, with: points, defaultValue: defaultValue)
+    }
+
+    /// 가우스로 고르기 (sigma: 칸 수). 양 끝은 있는 값만으로.
+    static func gaussian(_ v: [Double], sigma: Double) -> [Double] {
+        guard sigma > 0.3, v.count > 2 else { return v }
+        let r = Int((sigma * 3).rounded(.up))
+        let k = (-r...r).map { exp(-Double($0 * $0) / (2 * sigma * sigma)) }
+        return v.indices.map { i in
+            var sum = 0.0, wsum = 0.0
+            for j in -r...r where v.indices.contains(i + j) && !v[i + j].isNaN {
+                sum += v[i + j] * k[j + r]
+                wsum += k[j + r]
+            }
+            return wsum > 0 ? sum / wsum : v[i]
+        }
+    }
+}
+
+/// 음 높이 곡선을 펜으로 그리기: 화면에 보이는 선(실제로 부르는 높이)이 펜이 지나간 곳 그대로 되게 PITD를 만든다.
+/// - 음표 경계 · 넘어가는 모양 · 떨림이 있어도 선은 펜 자리 그대로 (예전에는 PITD를 직선으로 이어서 경계에서 선이 꺾였다)
+/// - 손 떨림은 살짝 고르고, 그린 곳 양 끝은 원래 선으로 부드럽게 이어서 소리가 튀지 않게 한다
+///   (예전에는 그린 끝 바로 옆 5틱에서 원래 값으로 뚝 떨어졌다)
+struct PitchSketch {
+    static let step = CurveMath.interval
+    /// 그린 곳 양 끝에서 원래 선으로 넘어가는 길이 (틱, 120BPM에서 약 30ms)
+    static let edge = 30
+    /// 손 떨림 고르기 (가우스 σ, 틱)
+    static let smoothing = 7.0
+
+    let original: CurveData
+    private let from: Int
+    private let base: [Double]
+    /// 5틱 칸 → 펜이 지나간 높이 (센트)
+    private var drawn: [Int: Double] = [:]
+    private var last: (x: Double, cents: Double)?
+
+    /// 0…1 → 0…1 부드럽게 (코사인)
+    static func ease(_ u: Double) -> Double { (1 - cos(.pi * max(0, min(1, u)))) / 2 }
+
+    init(notes: [NoteData], axis: TimeAxis, partPosition: Int, duration: Int, defaults: EngineDefaults, original: CurveData) {
+        let step = Self.step
+        let lo = Int((Double(min(0, notes.first?.position ?? 0) - 1920) / Double(step)).rounded(.down)) * step
+        let hi = max(duration, notes.map(\.end).max() ?? 0) + 1920
+        from = lo
+        base = PitchMath.base(notes, axis: axis, partPosition: partPosition, from: lo, step: step,
+                              count: (hi - lo) / step + 1, vibrato: true, defaults: defaults)
+        self.original = original
+    }
+
+    /// 그 틱에서 음표들이 만드는 높이 (센트, 떨림 포함)
+    func baseAt(_ x: Int) -> Double {
+        guard !base.isEmpty else { return 6000 }
+        let v = base[max(0, min(base.count - 1, (x - from) / Self.step))]
+        return v.isNaN ? 6000 : v
+    }
+
+    mutating func add(tick: Double, cents: Double) {
+        if let last {
+            // 지난 점에서 여기까지 (거꾸로 그어도) 사이 칸을 모두 채운다: 나중에 그은 것이 이긴다
+            let a = CurveMath.snap(min(last.x, tick)), b = CurveMath.snap(max(last.x, tick))
+            var x = a
+            while x <= b {
+                let u = abs(tick - last.x) < 1e-9 ? 1 : (Double(x) - last.x) / (tick - last.x)
+                drawn[x] = last.cents + (cents - last.cents) * max(0, min(1, u))
+                x += Self.step
+            }
+        } else {
+            drawn[CurveMath.snap(tick)] = cents
+        }
+        last = (tick, cents)
+    }
+
+    /// 지금까지 그린 것을 넣은 PITD
+    func result() -> CurveData {
+        guard let lo = drawn.keys.min(), let hi = drawn.keys.max() else { return original }
+        let step = Self.step
+        let n = (hi - lo) / step + 1
+        var target = (0..<n).map { drawn[lo + $0 * step] ?? .nan }
+        // 빈 칸은 양옆으로 잇는다
+        var lastGood: Int?
+        for i in 0..<n where !target[i].isNaN {
+            if let g = lastGood, i - g > 1 {
+                for k in (g + 1)..<i { target[k] = target[g] + (target[i] - target[g]) * Double(k - g) / Double(i - g) }
+            }
+            lastGood = i
+        }
+        target = CurveMath.gaussian(target, sigma: Self.smoothing / Double(step))
+        func clamp(_ v: Double) -> Int { max(-1200, min(1200, Int(v.rounded()))) }
+        var points: [(x: Int, y: Int)] = []
+        let e = Self.edge
+        // 왼쪽 끝: 원래 선에서 그린 선으로 부드럽게
+        var x = lo - e
+        while x < lo {
+            let w = Self.ease(Double(x - (lo - e)) / Double(e))
+            let old = Double(CurveMath.sample(original, x))
+            points.append((x, clamp(old + (target[0] - baseAt(x) - old) * w)))
+            x += step
+        }
+        for i in 0..<n {
+            let x = lo + i * step
+            points.append((x, clamp(target[i] - baseAt(x))))
+        }
+        // 오른쪽 끝
+        x = hi + step
+        while x <= hi + e {
+            let w = Self.ease(Double(hi + e - x) / Double(e))
+            let old = Double(CurveMath.sample(original, x))
+            points.append((x, clamp(old + (target[n - 1] - baseAt(x) - old) * w)))
+            x += step
+        }
+        var c = original
+        CurveMath.replace(&c, from: lo - e, to: hi + e, with: points)
+        return c
+    }
+}
+
+/// ⌥ 끌기: 곡선을 한 점에서 잡아 위아래로 민다. 둘레(radius 틱)는 종 모양으로 덜 움직인다.
+struct PitchBend {
+    let original: CurveData
+    let center: Int
+    let radius: Int
+
+    func result(delta: Double) -> CurveData {
+        let a = CurveMath.snap(Double(center - radius)), b = CurveMath.snap(Double(center + radius))
+        var points: [(x: Int, y: Int)] = []
+        var x = a
+        while x <= b {
+            let u = min(1, abs(Double(x - center)) / Double(max(1, radius)))
+            let w = (1 + cos(.pi * u)) / 2
+            let v = Double(CurveMath.sample(original, x)) + delta * w
+            points.append((x, max(-1200, min(1200, Int(v.rounded())))))
+            x += CurveMath.interval
+        }
+        var c = original
+        CurveMath.replace(&c, from: a, to: b, with: points)
+        return c
+    }
+}
+
+extension PitchMath {
+    /// 부르는 높이(음표 + 넘어가는 모양 + PITD, 떨림 설정은 빼고)를 [a, b]에서 가우스로 고른 PITD.
+    /// PITD만 고르면 음표 경계에서 높이가 튀어서, 부르는 높이로 고른 뒤 음표 높이를 다시 뺀다.
+    static func smoothed(_ pitd: CurveData, notes: [NoteData], axis: TimeAxis, partPosition: Int, defaults: EngineDefaults,
+                         from a: Int, to b: Int, sigma: Double) -> CurveData {
+        let step = CurveMath.interval
+        let margin = Int(sigma * 4) / step * step + step
+        let lo = CurveMath.snap(Double(a)) - margin, hi = CurveMath.snap(Double(b)) + margin
+        let count = (hi - lo) / step + 1
+        let base = PitchMath.base(notes, axis: axis, partPosition: partPosition, from: lo, step: step, count: count,
+                                  vibrato: false, defaults: defaults)
+        let sung = (0..<count).map { base[$0] + Double(CurveMath.sample(pitd, lo + $0 * step)) }
+        let smooth = CurveMath.gaussian(sung, sigma: sigma / Double(step))
+        let edge = PitchSketch.edge
+        var points: [(x: Int, y: Int)] = []
+        for i in 0..<count {
+            let x = lo + i * step
+            guard x >= a, x <= b, !base[i].isNaN else { continue }
+            // 구간 양 끝 edge 틱은 원래 곡선과 섞어서 잇는다
+            let w = min(1, PitchSketch.ease(Double(x - a) / Double(edge)), PitchSketch.ease(Double(b - x) / Double(edge)))
+            let old = Double(CurveMath.sample(pitd, x))
+            let new = smooth[i] - base[i]
+            points.append((x, max(-1200, min(1200, Int((old + (new - old) * w).rounded())))))
+        }
+        guard !points.isEmpty else { return pitd }
+        var c = pitd
+        CurveMath.replace(&c, from: points.first!.x, to: points.last!.x, with: points)
+        return c
     }
 }

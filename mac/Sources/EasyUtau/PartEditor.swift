@@ -76,11 +76,26 @@ final class PartEditor: ObservableObject {
     private var nextID = 1
     private var version = 0
     private var sentVersion = 0
+    /// 아직 안 보낸 고친 것의 이름 (새 섹터를 놓고 가사를 치는 동안: 섹터 넣기와 가사가 되돌리기 한 칸)
+    private var stagedLabel: String?
+    /// 보내는 중에 또 고친 것의 이름 (끝나고 한 번 더 보낼 때 쓴다)
+    private var nextLabel: String?
+    /// 다른 프로젝트를 열어서 버린 편집 화면: 더는 엔진에 보내지 않는다
+    private var closed = false
     private var lastLength = 480
     private var clipboard: [NoteData] = []
     /// 다 읽은 뒤 보여 줄 곳 (파트 틱)
     private var pendingReveal: Int?
+    /// 다 읽은 뒤 되살릴 화면 (다른 앱에서 고친 파일을 다시 읽을 때)
+    private var pendingView: ViewState?
+    /// 처음 보일 곳을 정했는지 (한 번만: 안 그러면 창 크기가 처음 바뀔 때 보던 곳이 튄다)
+    private var initialRevealDone = false
     let preview = TonePreview()
+
+    /// 그리는 중인 음 높이 곡선 (떼기 전까지는 악보에만 그리고 발행하지 않는다: 끌 때 화면 전체가 다시 계산되면 끊긴다)
+    private(set) var pitchDraft: CurveData? { didSet { redraw() } }
+    private var sketch: PitchSketch?
+    private var bend: PitchBend?
 
     init(model: AppModel, partIndex: Int) {
         self.model = model
@@ -104,18 +119,51 @@ final class PartEditor: ObservableObject {
 
     func playheadMoved() { canvas?.playheadMoved() }
 
+    // MARK: 보는 곳
+
+    struct ViewState {
+        var viewStart: Double
+        var pxPerTick: CGFloat
+        var rowHeight: CGFloat
+        var topTone: Double
+    }
+
+    var viewState: ViewState { ViewState(viewStart: viewStart, pxPerTick: pxPerTick, rowHeight: rowHeight, topTone: topTone) }
+
+    /// 보던 곳 그대로 (다시 읽은 뒤)
+    func restore(_ v: ViewState) {
+        if loading {
+            pendingView = v
+            return
+        }
+        initialRevealDone = true
+        viewStart = v.viewStart
+        pxPerTick = v.pxPerTick
+        rowHeight = v.rowHeight
+        topTone = v.topTone
+        redraw()
+    }
+
     // MARK: 엔진과 맞추기
 
+    /// 다른 프로젝트를 열 때: 아직 안 보낸 것을 버리고 더는 보내지 않는다.
+    func invalidate() {
+        closed = true
+        canvas?.endLyric(commit: false)
+    }
+
     /// 엔진에서 파트를 다시 읽는다 (처음 열 때 · 되돌리기 뒤).
-    func reload() async {
-        guard let model else { return }
+    func reload(keepSelection: Bool = false) async {
+        guard let model, !closed else { return }
         do {
             let reply = try await model.engine.send("part", ["part": partIndex])
             let part = try Engine.decode(PartData.self, reply["part"])
-            load(part, keepSelection: false)
+            guard !closed else { return }
+            cancelPitchEdit()
+            load(part, keepSelection: keepSelection)
             if loading {
                 loading = false
-                revealAfterLayout()
+                revealIfReady()
             }
         } catch {
             model.show(error.localizedDescription, success: false)
@@ -161,11 +209,27 @@ final class PartEditor: ObservableObject {
 
     /// 고친 것을 엔진에 보낸다 (되돌리기 한 칸). 보내는 중에 또 고치면 끝난 뒤 한 번 더.
     func commit(_ label: String = "command.note.edit") {
+        stage(label)
+        nextLabel = label
+        guard !syncing else { return }
+        Task { await send(label) }
+    }
+
+    /// 고친 것을 기억만 하고 아직 보내지 않는다. 다음 commit · commitStaged · flush 때 함께 간다 (되돌리기 한 칸).
+    func stage(_ label: String) {
         version += 1
         phonemesReady = false
         sortNotes()
-        guard !syncing else { return }
-        Task { await send(label) }
+        if stagedLabel == nil, label == "command.note.add" { stagedLabel = label }
+    }
+
+    /// 아직 엔진에 안 보낸 것이 있나 (입력 중인 가사 · 그리는 중인 곡선 포함)
+    var hasPendingEdits: Bool { sentVersion < version || syncing || pitchDraft != nil || canvas?.lyricNote != nil }
+
+    /// 기억만 해 둔 것을 보낸다 (새 섹터의 가사 입력이 끝났을 때).
+    func commitStaged() {
+        guard sentVersion < version, !syncing else { return }
+        Task { await send(stagedLabel ?? "command.note.edit") }
     }
 
     private func sortNotes() {
@@ -174,14 +238,17 @@ final class PartEditor: ObservableObject {
     }
 
     private func send(_ label: String) async {
-        guard let model else { return }
+        guard let model, !closed else { return }
         syncing = true
         defer { syncing = false }
-        while sentVersion < version {
+        while sentVersion < version, !closed {
             let v = version
+            let name = stagedLabel ?? nextLabel ?? label
+            stagedLabel = nil
+            nextLabel = nil
             let args: [String: Any] = [
                 "part": partIndex,
-                "label": label,
+                "label": name,
                 "notes": Engine.object(datas),
                 "curves": Engine.object(Array(curves.values).sorted { $0.abbr < $1.abbr }),
             ]
@@ -205,6 +272,7 @@ final class PartEditor: ObservableObject {
     /// 아직 안 보낸 것을 다 보낼 때까지 (저장 · 재생 · 되돌리기 전에).
     func flush() async {
         canvas?.endLyric()
+        finishPitchEdit()
         if !syncing && sentVersion < version { await send("command.note.edit") }
         while syncing { try? await Task.sleep(nanoseconds: 20_000_000) }
     }
@@ -243,7 +311,7 @@ final class PartEditor: ObservableObject {
         notes.append(EditNote(id: id, n: data))
         selection = [id]
         preview.play(data.tone)
-        if commitNow { commit("command.note.add") }
+        if commitNow { commit("command.note.add") } else { stage("command.note.add") }
         return id
     }
 
@@ -257,7 +325,7 @@ final class PartEditor: ObservableObject {
     func selectAll() { selection = Set(notes.map(\.id)) }
 
     func transposeSelection(_ semis: Int) {
-        let ids = selection.isEmpty ? Set(notes.map(\.id)) : selection
+        let ids = selection
         guard !ids.isEmpty else { return }
         for i in notes.indices where ids.contains(notes[i].id) {
             notes[i].n.tone = max(0, min(127, notes[i].n.tone + semis))
@@ -405,35 +473,86 @@ final class PartEditor: ObservableObject {
 
     var pitd: CurveData { curves["pitd"] ?? CurveData(abbr: "pitd", xs: [], ys: []) }
 
-    /// 펜으로 그을 때: (tick, 반음 높이) → PITD. lastTick은 지난 점.
-    func drawPitch(tick: Double, tone: Double, lastTick: Double?, lastTone: Double?) {
-        let d = datas
-        guard let base = PitchMath.drawBase(d, axis: axis, partPosition: position, tick: tick, defaults: defaults) else { return }
-        var c = pitd
-        let y = Int((tone * 100 - base).rounded())
-        let clamped = max(-1200, min(1200, y))
-        var lastX = Int(tick), lastY = clamped
-        if let lt = lastTick, let lv = lastTone,
-           let lb = PitchMath.drawBase(d, axis: axis, partPosition: position, tick: lt, defaults: defaults) {
-            lastX = Int(lt)
-            lastY = max(-1200, min(1200, Int((lv * 100 - lb).rounded())))
-        }
-        CurveMath.set(&c, x: Int(tick), y: clamped, lastX: lastX, lastY: lastY)
-        curves["pitd"] = c
+    /// 지금 보이는 PITD (그리는 중이면 그리는 것)
+    var shownPitd: CurveData? { pitchDraft ?? curves["pitd"] }
+
+    private var sortedDatas: [NoteData] { datas.sorted { ($0.position, $0.tone) < ($1.position, $1.tone) } }
+
+    /// 펜으로 긋기 시작 (tick: 파트 틱, tone: 반음 높이). 움직이기 전까지는 아무것도 바꾸지 않는다.
+    func beginPitchStroke(tick: Double, tone: Double) {
+        finishPitchEdit()
+        guard !notes.isEmpty else { return }
+        sketch = PitchSketch(notes: sortedDatas, axis: axis, partPosition: position, duration: duration,
+                             defaults: defaults, original: pitd)
+        sketch?.add(tick: tick, cents: tone * 100)
     }
 
-    /// 지우개: [a, b] 틱의 그린 곡선을 없앤다 (음표가 만드는 높이로 돌아감)
+    /// 펜이 움직임: 화면의 선이 펜이 지나간 곳 그대로 되게
+    func continuePitchStroke(tick: Double, tone: Double) {
+        guard sketch != nil else { return }
+        sketch?.add(tick: tick, cents: tone * 100)
+        pitchDraft = sketch?.result()
+    }
+
+    /// ⌥ 끌기: 그 자리의 곡선을 잡아 위아래로 민다 (둘레는 부드럽게 따라온다). radius: 틱
+    func beginPitchBend(tick: Double, radius: Int) {
+        finishPitchEdit()
+        bend = PitchBend(original: pitd, center: CurveMath.snap(tick), radius: max(30, radius))
+    }
+
+    func continuePitchBend(cents: Double) {
+        guard let bend else { return }
+        pitchDraft = bend.result(delta: cents)
+    }
+
+    /// 지우개로 [a, b]를 지나감: 그린 곡선이 없어지고 (음표가 만드는 높이로) 양 끝은 부드럽게
     func erasePitch(from a: Double, to b: Double) {
-        guard var c = curves["pitd"], !c.xs.isEmpty else { return }
-        CurveMath.reset(&c, from: Int(a), to: Int(b))
-        curves["pitd"] = c.xs.isEmpty ? nil : c
+        var c = pitchDraft ?? pitd
+        guard !c.xs.isEmpty else { return }
+        CurveMath.fade(&c, from: Int(min(a, b)), to: Int(max(a, b)), ramp: PitchSketch.edge)
+        pitchDraft = c
     }
 
-    /// 선택한 섹터(없으면 전체)의 그린 곡선 지우기
+    /// 떼었을 때: 그린 것을 넣고 되돌리기 한 칸. 바뀐 게 없으면 아무것도 안 한다.
+    func finishPitchEdit(_ label: String = "command.pitch.draw") {
+        let draft = pitchDraft
+        sketch = nil
+        bend = nil
+        pitchDraft = nil
+        guard let draft, draft != pitd else { return }
+        curves["pitd"] = draft.xs.isEmpty ? nil : draft
+        commit(label)
+    }
+
+    /// 그리던 것을 버린다 (Esc · 되돌리기)
+    func cancelPitchEdit() {
+        sketch = nil
+        bend = nil
+        pitchDraft = nil
+    }
+
+    /// 선택한 섹터(없으면 전체)의 음 높이를 부드럽게: 손으로 그리거나 AutoTuner가 따온 곡선의 잔떨림을 고른다.
+    /// 비브라토(떨림 설정)는 그대로 둔다.
+    func smoothPitchOfSelection() {
+        let sel = selection.isEmpty ? notes : selected
+        guard let a = sel.map(\.n.position).min(), let b = sel.map(\.n.end).max() else { return }
+        let ticksPerMs = Double(axis.tick(ms: axis.ms(Double(position + a)) + 100) - Double(position + a)) / 100
+        let sigma = max(5, 18 * ticksPerMs)  // 약 18ms
+        let new = PitchMath.smoothed(pitd, notes: sortedDatas, axis: axis, partPosition: position, defaults: defaults,
+                                     from: a, to: b, sigma: sigma)
+        guard new != pitd else {
+            model?.show("고를 곡선이 없어요", success: false)
+            return
+        }
+        curves["pitd"] = new.xs.isEmpty ? nil : new
+        commit("command.pitch.smooth")
+    }
+
+    /// 선택한 섹터(없으면 전체)의 그린 곡선 지우기 (양 끝은 부드럽게)
     func resetPitchOfSelection() {
         let sel = selection.isEmpty ? notes : selected
         guard var c = curves["pitd"], let a = sel.map(\.n.position).min(), let b = sel.map(\.n.end).max() else { return }
-        CurveMath.reset(&c, from: a, to: b)
+        CurveMath.fade(&c, from: a, to: b, ramp: PitchSketch.edge)
         curves["pitd"] = c.xs.isEmpty ? nil : c
         commit("command.pitch.reset")
     }
@@ -486,9 +605,23 @@ final class PartEditor: ObservableObject {
 
     // MARK: 보기
 
-    /// 처음 열 때 보일 곳: AutoTuner에서 넘어온 시간, 아니면 섹터들
-    func revealAfterLayout() {
-        if let t = pendingReveal {
+    /// 다 읽었고 악보 크기가 정해졌으면 처음 보일 곳으로 (한 번만)
+    func revealIfReady() {
+        guard !initialRevealDone, !loading, let c = canvas, c.bounds.height > 100 else { return }
+        initialRevealDone = true
+        revealAfterLayout()
+    }
+
+    /// 처음 열 때 보일 곳: 되살릴 화면, AutoTuner에서 넘어온 시간, 아니면 섹터들
+    private func revealAfterLayout() {
+        if let v = pendingView {
+            pendingView = nil
+            restore(v)
+            if let t = pendingReveal {
+                pendingReveal = nil
+                reveal(tick: t, select: true)
+            }
+        } else if let t = pendingReveal {
             pendingReveal = nil
             reveal(tick: t, select: true)
         } else {
@@ -512,10 +645,11 @@ final class PartEditor: ObservableObject {
 
     /// tick(파트 틱)이 보이게, select면 거기 섹터를 고른다.
     func reveal(tick: Int, select: Bool) {
-        if loading {
+        if loading || (canvas?.bounds.height ?? 0) <= 100 {
             pendingReveal = tick
             return
         }
+        initialRevealDone = true
         let width = Double((canvas?.bounds.width ?? 900) - PianoRollView.keyWidth) / Double(pxPerTick)
         if Double(tick) < viewStart || Double(tick) > viewStart + width * 0.85 {
             viewStart = Double(tick) - width * 0.2
@@ -566,8 +700,11 @@ final class PartEditor: ObservableObject {
         guard flags.subtracting(.shift).isEmpty else { return false }
         switch key {
         case kVK_Delete, kVK_ForwardDelete: deleteSelection()
-        case kVK_UpArrow: transposeSelection(flags.contains(.shift) ? 12 : 1)
-        case kVK_DownArrow: transposeSelection(flags.contains(.shift) ? -12 : -1)
+        case kVK_UpArrow, kVK_DownArrow:
+            // 고른 섹터가 없으면 아무것도 안 한다 (예전에는 노래 전체가 올라갔다)
+            guard !selection.isEmpty else { return false }
+            let up = key == kVK_UpArrow
+            transposeSelection((flags.contains(.shift) ? 12 : 1) * (up ? 1 : -1))
         case kVK_LeftArrow, kVK_RightArrow:
             guard !selection.isEmpty else { return false }
             nudgeSelection(key == kVK_LeftArrow ? -1 : 1)
@@ -575,6 +712,11 @@ final class PartEditor: ObservableObject {
             guard !selection.isEmpty else { return false }
             canvas?.beginLyric()
         case kVK_Escape:
+            if pitchDraft != nil {
+                cancelPitchEdit()
+                canvas?.cancelDrag()
+                return true
+            }
             guard !selection.isEmpty else { return false }
             selection = []
         case kVK_ANSI_1: tool = .note

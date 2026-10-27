@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
@@ -19,13 +20,49 @@ namespace EasyUtau.Engine {
     sealed class Session : ICmdSubscriber {
         const string Version = "1";
 
-        // 저장한 뒤로 고친 적이 있는지: 고칠 때마다 1씩, 저장하면 그때 값을 기억
+        // 저장한 뒤로 고친 적이 있는지. OpenUtau처럼 "저장할 때 되돌리기 줄 맨 위 묶음"을 기억해서,
+        // 고쳤다가 ⌘Z로 저장한 때까지 되돌리면 다시 "저장됨"이 된다. (그 줄을 못 읽는 OpenUtau면 고칠 때마다 세는 방식)
         long generation;
         long savedGeneration;
-        public bool Saved => generation == savedGeneration;
+        object savedTop;
+        bool savedValid = true;
+        // 되돌리기 줄에 안 들어가는 변경 (음소거 · 볼륨 등)을 저장한 뒤에 했는지
+        bool mixDirty;
+        static readonly FieldInfo UndoQueueField =
+            typeof(DocManager).GetField("undoQueue", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        public bool Saved {
+            get {
+                if (UndoQueueField == null) {
+                    return generation == savedGeneration;
+                }
+                return savedValid && !mixDirty && ReferenceEquals(UndoTop(), savedTop);
+            }
+        }
+
+        /// <summary>OpenUtau 되돌리기 줄의 맨 위 묶음 (없으면 null).</summary>
+        static object UndoTop() {
+            if (UndoQueueField?.GetValue(DocManager.Inst) is not System.Collections.IEnumerable queue) {
+                return null;
+            }
+            object last = null;
+            foreach (var group in queue) {
+                last = group;
+            }
+            return last;
+        }
+
+        void MarkSaved() {
+            savedGeneration = generation;
+            savedTop = UndoTop();
+            savedValid = true;
+            mixDirty = false;
+        }
 
         int lastTick = -1;
         bool wasPlaying;
+        // 재생 요청 번호: 발음을 기다리는 사이에 멈추기 · 다른 재생이 오면 앞의 것은 시작하지 않는다
+        int playSerial;
         bool waiting;
         readonly HashSet<UVoicePart> phonemized = new HashSet<UVoicePart>();
         DateTime lastProgress = DateTime.MinValue;
@@ -40,7 +77,8 @@ namespace EasyUtau.Engine {
             DocManager.Inst.AddSubscriber(this);
             var project = NewProject(null);
             DocManager.Inst.ExecuteCmd(new LoadProjectNotification(project));
-            generation = savedGeneration = 0;
+            generation = 0;
+            MarkSaved();
             Protocol.Event("ready", new JsonObject {
                 ["version"] = Version,
                 ["openutau"] = typeof(DocManager).Assembly.GetName().Version?.ToString() ?? "",
@@ -203,15 +241,25 @@ namespace EasyUtau.Engine {
                 case "setPart":
                     return SetPart(req);
                 case "undo":
-                    Stop();
-                    DocManager.Inst.Undo();
-                    generation++;
-                    return ProjectJson();
-                case "redo":
-                    Stop();
-                    DocManager.Inst.Redo();
-                    generation++;
-                    return ProjectJson();
+                case "redo": {
+                    // 되돌릴 것이 없으면 아무것도 하지 않고 "done": false (앱이 "더 되돌릴 게 없어요"라고 알린다)
+                    bool undo = cmd == "undo";
+                    string label = null;
+                    bool can = undo ? DocManager.Inst.GetUndoState(out label) : DocManager.Inst.GetRedoState(out label);
+                    if (can) {
+                        Stop();
+                        if (undo) {
+                            DocManager.Inst.Undo();
+                        } else {
+                            DocManager.Inst.Redo();
+                        }
+                        generation++;
+                    }
+                    var result = ProjectJson();
+                    result["done"] = can;
+                    result["label"] = label ?? "";
+                    return result;
+                }
                 case "addTrack":
                     return AddTrack(req);
                 case "removeTrack": {
@@ -302,6 +350,7 @@ namespace EasyUtau.Engine {
                 }
                 case "play": {
                     Stop();
+                    int serial = ++playSerial;
                     DocManager.Inst.FlushValidation();
                     int tick = Math.Max(0, Int(req, "tick", 0));
                     if (Project.EndTick <= tick) {
@@ -310,6 +359,10 @@ namespace EasyUtau.Engine {
                     // 방금 고친 음표의 발음이 아직 안 나왔으면 나올 때까지 기다렸다가 (안 그러면 고치기 전 소리가 난다)
                     var id = req["id"]?.DeepClone();
                     WhenPhonemized(() => {
+                        if (serial != playSerial) {
+                            Reply(id, new JsonObject { ["ok"] = true, ["cancelled"] = true });
+                            return;
+                        }
                         try {
                             DocManager.Inst.ExecuteCmd(new SetPlayPosTickNotification(tick));
                             PlaybackManager.Inst.Play(Project, tick);
@@ -321,6 +374,7 @@ namespace EasyUtau.Engine {
                     return new JsonObject { ["_async"] = true };
                 }
                 case "stop":
+                    playSerial++;
                     Stop();
                     return new JsonObject();
                 case "otos":
@@ -470,7 +524,8 @@ namespace EasyUtau.Engine {
             Stop();
             DocManager.Inst.ExecuteCmd(new LoadProjectNotification(project));
             phonemized.Clear();
-            generation = savedGeneration = 0;
+            generation = 0;
+            MarkSaved();
         }
 
         JsonObject Open(string path) {
@@ -490,12 +545,14 @@ namespace EasyUtau.Engine {
                 project.FilePath = "";  // ust · mid 등은 저장할 때 ustx로 새로 고르게
             }
             Load(project);
-            if (!string.IsNullOrEmpty(project.FilePath)) {
-                savedGeneration = generation;
-            } else {
+            if (string.IsNullOrEmpty(project.FilePath)) {
+                // ust · mid 등: ustx로 저장하기 전까지는 "저장 안 함"
                 savedGeneration = -1;
+                savedValid = false;
             }
-            return ProjectJson();
+            var result = ProjectJson();
+            result["format"] = format.ToString();
+            return result;
         }
 
         /// <summary>OpenUtau와 같은 ustx로 저장. 다 쓴 뒤에 바꿔 끼워서, 저장하다 꺼져도 원래 파일이 깨지지 않는다.</summary>
@@ -523,7 +580,7 @@ namespace EasyUtau.Engine {
             File.WriteAllText(tmp, text, new UTF8Encoding(false));
             File.Move(tmp, path, true);
             project.Saved = true;
-            savedGeneration = generation;
+            MarkSaved();
         }
 
         JsonObject SetPart(JsonObject req) {
@@ -669,6 +726,7 @@ namespace EasyUtau.Engine {
                     DocManager.Inst.ExecuteCmd(new PanChangeNotification(t.TrackNo, t.Pan));
                 }
                 generation++;
+                mixDirty = true;
             }
             return ProjectJson();
         }

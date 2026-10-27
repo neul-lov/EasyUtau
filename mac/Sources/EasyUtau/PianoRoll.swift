@@ -77,7 +77,10 @@ final class PianoRollView: NSView {
         case move(anchor: Int, origin: [Int: NoteData], start: NSPoint, lastTone: Int)
         case resize(anchor: Int, origin: [Int: NoteData], start: NSPoint)
         case band(start: NSPoint, current: NSPoint, base: Set<Int>)
-        case pitch(lastTick: Double, lastTone: Double)
+        /// 펜으로 곡선 긋기 (조금이라도 움직여야 그린다: 그냥 누르면 아무것도 안 바뀐다)
+        case pitch(start: NSPoint, moved: Bool)
+        /// ⌥ 끌기: 곡선을 잡아 위아래로 밀기
+        case bend(start: NSPoint)
         case erase(lastTick: Double, downNote: Int?, moved: Bool)
     }
 
@@ -85,7 +88,6 @@ final class PianoRollView: NSView {
     private var changed = false
     private var heldKey: Int?
     private var hover: NSPoint?
-    private var revealedOnce = false
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -166,8 +168,8 @@ final class PianoRollView: NSView {
         let playing = model?.playing == true
         let playTick = Double((model?.playTick ?? 0) - e.position)
         let startTick = Double((model?.startTick ?? 0) - e.position)
-        // 재생 중에는 재생 위치를 따라간다
-        if playing, case .none = drag, lyricNote == nil {
+        // "재생 따라가기"를 켰을 때만 재생 위치가 화면 밖으로 나가면 한 쪽 넘긴다 (기본은 보던 곳 그대로)
+        if playing, model?.followPlayback == true, case .none = drag, lyricNote == nil {
             let visible = Double((w - keyW) / e.pxPerTick)
             if playTick < e.viewStart || playTick > e.viewStart + visible * 0.92 { e.viewStart = playTick - visible * 0.08 }
         }
@@ -368,7 +370,15 @@ final class PianoRollView: NSView {
     }
 
     /// 실제로 부르는 높이: 섹터 높이 + 넘어가는 모양 + 떨림 + 그린 곡선 (OpenUtau와 같은 계산).
+    /// 곡선을 그리는 중이면 원래 선은 흐리게 함께 보여 준다.
     private func drawPitchLine(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double) {
+        if e.pitchDraft != nil {
+            drawPitchLine(e, ctx, t0: t0, t1: t1, pitd: e.curves["pitd"], faint: true)
+        }
+        drawPitchLine(e, ctx, t0: t0, t1: t1, pitd: e.shownPitd, faint: false)
+    }
+
+    private func drawPitchLine(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double, pitd: CurveData?, faint: Bool) {
         let notes = e.datas.sorted { ($0.position, $0.tone) < ($1.position, $1.tone) }
         guard !notes.isEmpty else { return }
         let step = max(5, Int((2 / e.pxPerTick).rounded()) / 5 * 5)
@@ -381,7 +391,7 @@ final class PianoRollView: NSView {
         let sub = Array(notes[max(0, first - 1)...min(notes.count - 1, last + 1)])
         var cents = PitchMath.base(sub, axis: e.axis, partPosition: e.position, from: from, step: step, count: count,
                                    vibrato: true, defaults: e.defaults)
-        if let pitd = e.curves["pitd"], !pitd.xs.isEmpty {
+        if let pitd, !pitd.xs.isEmpty {
             for i in 0..<count { cents[i] += Double(CurveMath.sample(pitd, from + i * step)) }
         }
         // 섹터가 있는 곳만 (앞 섹터와 떨어진 섹터는 조금 앞에서부터: 넘어오는 모양)
@@ -404,6 +414,15 @@ final class PianoRollView: NSView {
         ctx.clip(to: CGRect(x: keyW, y: rulerH, width: bounds.width - keyW, height: gridBottom - rulerH))
         ctx.setLineJoin(.round)
         ctx.setLineCap(.round)
+        if faint {
+            ctx.addPath(path)
+            ctx.setStrokeColor(NSColor.pitchLine.withAlphaComponent(0.3).cgColor)
+            ctx.setLineWidth(1.4)
+            ctx.setLineDash(phase: 0, lengths: [4, 3])
+            ctx.strokePath()
+            ctx.restoreGState()
+            return
+        }
         ctx.addPath(path)
         ctx.setStrokeColor(NSColor.textBackgroundColor.withAlphaComponent(0.75).cgColor)
         ctx.setLineWidth(strong ? 4.5 : 3.5)
@@ -606,11 +625,16 @@ final class PianoRollView: NSView {
         return f
     }
 
+    /// 입력한 가사를 넣는다. 그대로면 새 섹터만 보낸다 (섹터 넣기 + 가사가 되돌리기 한 칸).
     private func commitLyric() {
         guard let e = editor, let id = lyricNote, let field = lyricField else { return }
-        guard field.stringValue != lyricOpenedWith else { return }
+        guard field.stringValue != lyricOpenedWith else {
+            e.commitStaged()
+            return
+        }
         e.setLyric(field.stringValue, for: id)
         lyricOpenedWith = field.stringValue
+        e.commitStaged()
     }
 
     private func moveLyric(_ direction: Int) {
@@ -626,7 +650,7 @@ final class PianoRollView: NSView {
 
     func endLyric(commit: Bool = true) {
         guard lyricNote != nil else { return }
-        if commit { commitLyric() }
+        if commit { commitLyric() } else { editor?.commitStaged() }
         lyricNote = nil
         lyricField?.removeFromSuperview()
         window?.makeFirstResponder(self)
@@ -643,6 +667,13 @@ final class PianoRollView: NSView {
     }
 
     func playheadMoved() { needsDisplay = true }
+
+    /// 끌던 것을 그만둔다 (Esc)
+    func cancelDrag() {
+        drag = .none
+        changed = false
+        needsDisplay = true
+    }
 
     // MARK: 마우스
 
@@ -685,7 +716,9 @@ final class PianoRollView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard let e = editor else { return }
         if event.modifierFlags.contains(.control) {
+            // ⌃클릭 = 우클릭: 떼면 시작점이 정해진다
             rightMouseDown(with: event)
+            drag = .ruler
             return
         }
         endLyric()
@@ -713,11 +746,16 @@ final class PianoRollView: NSView {
             return
         }
         let hitNote = hit(p)
+        // ⌥ 끌기 (음 높이 도구, 또는 섹터 도구의 빈 곳): 곡선을 잡아 밀기
+        if flags.contains(.option), e.tool == .pitch || (e.tool == .note && hitNote == nil) {
+            e.beginPitchBend(tick: tick(p.x), radius: Int(70 / e.pxPerTick))
+            drag = .bend(start: p)
+            return
+        }
         switch e.tool {
         case .pitch:
-            e.drawPitch(tick: tick(p.x), tone: toneValue(p.y), lastTick: nil, lastTone: nil)
-            drag = .pitch(lastTick: tick(p.x), lastTone: toneValue(p.y))
-            changed = true
+            e.beginPitchStroke(tick: tick(p.x), tone: toneValue(p.y))
+            drag = .pitch(start: p, moved: false)
             return
         case .erase:
             drag = .erase(lastTick: tick(p.x), downNote: hitNote?.0.id, moved: false)
@@ -768,14 +806,17 @@ final class PianoRollView: NSView {
         case .pending(let start):
             guard abs(p.x - start.x) > 3 || abs(p.y - start.y) > 3 else { return }
             // 빈 곳에서 끌기: 음 높이 곡선 그리기
-            e.drawPitch(tick: tick(start.x), tone: toneValue(start.y), lastTick: nil, lastTone: nil)
-            e.drawPitch(tick: tick(p.x), tone: toneValue(p.y), lastTick: tick(start.x), lastTone: toneValue(start.y))
-            drag = .pitch(lastTick: tick(p.x), lastTone: toneValue(p.y))
+            e.beginPitchStroke(tick: tick(start.x), tone: toneValue(start.y))
+            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y))
+            drag = .pitch(start: start, moved: true)
             changed = true
-        case let .pitch(lastTick, lastTone):
-            let t = tick(p.x), v = toneValue(p.y)
-            e.drawPitch(tick: t, tone: v, lastTick: lastTick, lastTone: lastTone)
-            drag = .pitch(lastTick: t, lastTone: v)
+        case let .pitch(start, moved):
+            guard moved || abs(p.x - start.x) > 2 || abs(p.y - start.y) > 2 else { return }
+            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y))
+            drag = .pitch(start: start, moved: true)
+            changed = true
+        case let .bend(start):
+            e.continuePitchBend(cents: Double((start.y - p.y) / e.rowHeight) * 100)
             changed = true
         case let .erase(lastTick, downNote, _):
             let t = tick(p.x)
@@ -840,14 +881,16 @@ final class PianoRollView: NSView {
         case .ruler:
             model?.setStart(model?.startTick ?? 0)
         case .pending:
-            // 빈 곳 클릭: 그 음 높이에 새 섹터, 바로 가사 입력
-            let id = e.addNote(at: tick(p.x), tone: tone(p.y))
+            // 빈 곳 클릭: 그 음 높이에 새 섹터, 바로 가사 입력 (가사를 넣을 때 함께 보낸다: 되돌리기 한 칸)
+            let id = e.addNote(at: tick(p.x), tone: tone(p.y), commitNow: false)
             beginLyric(id)
         case .pitch:
-            if changed { e.commit("command.pitch.draw") }
+            if changed { e.finishPitchEdit("command.pitch.draw") } else { e.cancelPitchEdit() }
+        case .bend:
+            if changed { e.finishPitchEdit("command.pitch.bend") } else { e.cancelPitchEdit() }
         case let .erase(_, downNote, moved):
             if moved {
-                if changed { e.commit("command.pitch.erase") }
+                if changed { e.finishPitchEdit("command.pitch.erase") }
             } else if let id = downNote {
                 e.selection = [id]
                 e.deleteSelection()
@@ -875,8 +918,8 @@ final class PianoRollView: NSView {
         endLyric()
         window?.makeFirstResponder(self)
         let p = convert(event.locationInWindow, from: nil)
+        // 떼는 순간에 정한다 (재생 중이면 거기서 한 번만 다시 시작)
         moveStart(to: p.x, onNote: true, at: p)
-        model?.setStart(model?.startTick ?? 0)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
@@ -931,10 +974,7 @@ final class PianoRollView: NSView {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        if !revealedOnce, newSize.height > 100, let e = editor, !e.loading {
-            revealedOnce = true
-            e.revealAfterLayout()
-        }
+        editor?.revealIfReady()
         needsDisplay = true
     }
 }

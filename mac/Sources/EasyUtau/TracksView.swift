@@ -10,11 +10,13 @@ final class TracksCanvasView: NSView {
 
     weak var model: AppModel?
 
+    /// 끄는 동안은 화면에만 옮겨 보이고, 떼면 한 번만 엔진에 보낸다 (되돌리기 한 칸).
+    /// 예전에는 끄는 동안 마디마다 보내서 ⌘Z를 여러 번 눌러야 했다.
     private enum Drag {
         case none
         case ruler
-        case movePart(index: Int, startTick: Int, startTrack: Int, start: NSPoint, moved: Bool)
-        case resizePart(index: Int, startDuration: Int, start: NSPoint, moved: Bool)
+        case movePart(index: Int, startTick: Int, startTrack: Int, start: NSPoint, tick: Int, track: Int, moved: Bool)
+        case resizePart(index: Int, startDuration: Int, start: NSPoint, duration: Int, moved: Bool)
         case volume(track: Int)
     }
 
@@ -42,8 +44,18 @@ final class TracksCanvasView: NSView {
     private func trackIndex(_ y: CGFloat) -> Int { Int(floor((y + scrollY - rulerH) / trackH)) }
 
     private func partRect(_ p: PartSummary) -> CGRect {
-        CGRect(x: x(Double(p.position)), y: rowTop(p.track) + 5,
-               width: max(6, x(Double(p.end)) - x(Double(p.position))), height: trackH - 10)
+        var position = p.position, track = p.track, duration = p.duration
+        switch drag {
+        case let .movePart(index, _, _, _, tick, t, _) where index == p.index:
+            position = tick
+            track = t
+        case let .resizePart(index, _, _, d, _) where index == p.index:
+            duration = d
+        default:
+            break
+        }
+        return CGRect(x: x(Double(position)), y: rowTop(track) + 5,
+                      width: max(6, x(Double(position + duration)) - x(Double(position))), height: trackH - 10)
     }
 
     /// 그 점의 파트, 오른쪽 끝(길이)인지
@@ -76,7 +88,7 @@ final class TracksCanvasView: NSView {
         let ink = NSColor.labelColor
         let playTick = Double(model.playTick)
 
-        if model.playing, case .none = drag {
+        if model.playing, model.followPlayback, case .none = drag {
             let visible = Double((w - headerW) / pxPerTick)
             if playTick < viewStart || playTick > viewStart + visible * 0.92 { viewStart = playTick - visible * 0.08 }
         }
@@ -133,7 +145,7 @@ final class TracksCanvasView: NSView {
                 let top = r.minY + 16, usable = r.height - 22
                 ctx.setFillColor(color.withAlphaComponent(0.95).cgColor)
                 for n in notes {
-                    let a = x(Double(part.position + n[0])), b = x(Double(part.position + n[0] + n[1]))
+                    let a = r.minX + CGFloat(n[0]) * pxPerTick, b = r.minX + CGFloat(n[0] + n[1]) * pxPerTick
                     guard b > r.minX, a < r.maxX else { continue }
                     let y = top + usable * (1 - CGFloat(n[2] - lo) / CGFloat(span))
                     ctx.fill(CGRect(x: max(a, r.minX + 2), y: y, width: max(1.5, min(b, r.maxX - 2) - a), height: 2))
@@ -342,7 +354,8 @@ final class TracksCanvasView: NSView {
         window?.makeFirstResponder(self)
         let p = convert(event.locationInWindow, from: nil)
         if p.y < rulerH {
-            model.setStart(max(0, Int(model.axis.barStart(model.axis.bar(at: max(0, Int(tick(p.x)))).bar))))
+            // 끄는 동안은 시작점만 옮기고, 떼면 (재생 중이면) 거기서 한 번 다시 재생
+            model.setStart(max(0, Int(model.axis.barStart(model.axis.bar(at: max(0, Int(tick(p.x)))).bar))), restart: false)
             drag = .ruler
             needsDisplay = true
             return
@@ -369,9 +382,10 @@ final class TracksCanvasView: NSView {
         }
         if let (part, edge) = hit(p) {
             if edge {
-                drag = .resizePart(index: part.index, startDuration: part.duration, start: p, moved: false)
+                drag = .resizePart(index: part.index, startDuration: part.duration, start: p, duration: part.duration, moved: false)
             } else {
-                drag = .movePart(index: part.index, startTick: part.position, startTrack: part.track, start: p, moved: false)
+                drag = .movePart(index: part.index, startTick: part.position, startTrack: part.track, start: p,
+                                 tick: part.position, track: part.track, moved: false)
             }
             return
         }
@@ -389,49 +403,55 @@ final class TracksCanvasView: NSView {
         case .none:
             break
         case .ruler:
-            model.setStart(max(0, Int(tick(max(p.x, headerW)))))
+            model.setStart(max(0, Int(tick(max(p.x, headerW)))), restart: false)
         case let .volume(track):
             setVolume(track, at: p)
-        case let .movePart(index, startTick, startTrack, start, _):
-            guard let part = project.parts[safe: index] else { return }
+        case let .movePart(index, startTick, startTrack, start, _, _, moved):
+            guard project.parts[safe: index] != nil else { return }
+            guard moved || abs(p.x - start.x) > 3 || abs(p.y - start.y) > 3 else { return }
             let bar = model.axis.barSegment(tick: max(0, startTick))
             let dt = Int(((tick(p.x) - tick(start.x)) / Double(bar.ticksPerBar)).rounded()) * bar.ticksPerBar
             let dTrack = Int(((p.y - start.y) / trackH).rounded())
             let newTick = max(0, startTick + dt)
             let newTrack = max(0, min(project.tracks.count - 1, startTrack + dTrack))
-            if newTick != part.position || newTrack != part.track {
-                model.movePart(index, to: newTick, track: newTrack)
-            }
-            drag = .movePart(index: index, startTick: startTick, startTrack: startTrack, start: start, moved: true)
-        case let .resizePart(index, startDuration, start, _):
+            drag = .movePart(index: index, startTick: startTick, startTrack: startTrack, start: start,
+                             tick: newTick, track: newTrack, moved: true)
+        case let .resizePart(index, startDuration, start, _, moved):
             guard let part = project.parts[safe: index], part.isVoice else { return }
+            guard moved || abs(p.x - start.x) > 3 else { return }
             let bar = model.axis.barSegment(tick: part.position)
             let dt = Int(((tick(p.x) - tick(start.x)) / Double(bar.ticksPerBar)).rounded()) * bar.ticksPerBar
             let newDuration = max(bar.ticksPerBar, startDuration + dt)
-            if newDuration != part.duration { model.resizePart(index, duration: newDuration) }
-            drag = .resizePart(index: index, startDuration: startDuration, start: start, moved: true)
+            drag = .resizePart(index: index, startDuration: startDuration, start: start, duration: newDuration, moved: true)
         }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
         guard let model else { return }
-        switch drag {
-        case let .movePart(index, _, _, _, moved):
-            // 끌지 않고 누르기만 하면: 그 목소리 덩어리를 편집 화면에서 연다
-            if !moved {
-                if model.project?.parts[safe: index]?.isVoice == true {
-                    model.openPart(index)
-                } else if let part = model.project?.parts[safe: index] {
-                    model.setStart(part.position)
-                }
+        let ended = drag
+        drag = .none
+        switch ended {
+        case .ruler:
+            model.setStart(model.startTick)
+        case let .movePart(index, startTick, startTrack, _, tick, track, moved):
+            if moved {
+                if tick != startTick || track != startTrack { model.movePart(index, to: tick, track: track) }
+            } else if model.project?.parts[safe: index]?.isVoice == true {
+                // 끌지 않고 누르기만 하면: 그 목소리 덩어리를 편집 화면에서 연다
+                model.openPart(index)
+            } else if let part = model.project?.parts[safe: index] {
+                model.setStart(part.position)
             }
-        case let .resizePart(index, _, _, moved):
-            if !moved, model.project?.parts[safe: index]?.isVoice == true { model.openPart(index) }
+        case let .resizePart(index, startDuration, _, duration, moved):
+            if moved {
+                if duration != startDuration { model.resizePart(index, duration: duration) }
+            } else if model.project?.parts[safe: index]?.isVoice == true {
+                model.openPart(index)
+            }
         default:
             break
         }
-        drag = .none
         needsDisplay = true
     }
 
@@ -477,7 +497,7 @@ final class TracksCanvasView: NSView {
                 model.importAudio(track: t, at: max(0, Int(self.tick(p.x))))
             })
             menu.addItem(ClosureMenuItem(title: "여기서부터 재생", keyEquivalent: "") {
-                model.setStart(max(0, Int(self.tick(p.x))))
+                model.setStart(max(0, Int(self.tick(p.x))), restart: false)
                 model.play(from: model.startTick)
             })
             NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -488,7 +508,7 @@ final class TracksCanvasView: NSView {
             menu.addItem(ClosureMenuItem(title: "편집 화면에서 열기", keyEquivalent: "") { model.openPart(part.index) })
         }
         menu.addItem(ClosureMenuItem(title: "여기서부터 재생", keyEquivalent: "") {
-            model.setStart(part.position)
+            model.setStart(part.position, restart: false)
             model.play(from: part.position)
         })
         menu.addItem(.separator())
@@ -618,6 +638,7 @@ struct TracksView: View {
                 }
             }
 
+            FollowToggle(model: model)
             tempoField
             CircleIconButton(icon: "waveform.badge.plus", help: "반주나 원래 노래 같은 소리 파일 넣기") { model.importAudio() }
             CircleIconButton(icon: "plus", help: "트랙 더하기", tint: .easy) { model.addTrack() }
@@ -647,6 +668,7 @@ struct TracksView: View {
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 58)
                 .font(.system(size: 11.5, weight: .semibold))
+                .onSubmit { model.endTextEditing() }  // 엔터 뒤에는 스페이스 · ⌘Z가 바로 되게
         }
         .help("곡의 빠르기. 바꾸면 섹터 위치가 그대로 있는 채로 빠르기만 바뀌어요")
     }
@@ -658,6 +680,7 @@ struct TracksView: View {
             KeyHint("끌기", "옮기기 · 오른쪽 끝은 길이")
             KeyHint("우클릭", "가수 · 색 · 지우기")
             KeyHint("Space", "들어 보기")
+            KeyHint("⌘Z · ⌘Y", "되돌리기 · 다시")
             KeyHint("⌘S", "저장")
             Spacer(minLength: 0)
             if let warning = model.audioWarning {

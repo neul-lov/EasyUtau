@@ -29,14 +29,27 @@ struct EasyUtauApp: App {
                 Button("소리 파일로 내보내기 (wav)…") { delegate.model.exportWav() }
                     .keyboardShortcut("e")
             }
-            CommandGroup(replacing: .undoRedo) {
-                Button("되돌리기") { delegate.model.undo() }
-                    .keyboardShortcut("z")
-                    .disabled(!delegate.model.canUndo)
-                Button("다시 하기") { delegate.model.redo() }
-                    .keyboardShortcut("z", modifiers: [.command, .shift])
-                    .disabled(!delegate.model.canRedo)
-            }
+            EditCommands(model: delegate.model)
+        }
+    }
+}
+
+/// 편집 메뉴. 모델을 지켜봐서 되돌리기 · 다시 하기가 할 수 있을 때만 켜진다
+/// (App의 commands 안에서 바로 읽으면 처음 값으로 굳어 버려서 따로 뺐다).
+struct EditCommands: Commands {
+    @ObservedObject var model: AppModel
+
+    var body: some Commands {
+        CommandGroup(replacing: .undoRedo) {
+            Button("되돌리기") { model.undoFromMenu(redo: false) }
+                .keyboardShortcut("z")
+                .disabled(!model.canUndo)
+            Button("다시 하기") { model.undoFromMenu(redo: true) }
+                .keyboardShortcut("y")
+                .disabled(!model.canRedo)
+            Button("다시 하기 (⌘⇧Z)") { model.undoFromMenu(redo: true) }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+                .disabled(!model.canRedo)
         }
     }
 }
@@ -59,10 +72,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for url in urls { model.handle(url: url) }
     }
 
+    /// 다른 앱(OpenUtau · AutoTuner)에서 돌아오면: 그 사이에 바뀐 파일 · AutoTuner 결과를 다시 본다.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model.becameActive()
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard model.hasUnsavedChanges else { return .terminateNow }
+        guard model.needsSaveBeforeQuit else { return .terminateNow }
         let alert = NSAlert()
         alert.messageText = "저장하지 않은 내용이 있어요"
         alert.informativeText = "\(model.project?.displayName ?? "이 프로젝트")를 저장할까요?"

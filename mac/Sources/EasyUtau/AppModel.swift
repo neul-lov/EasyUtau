@@ -26,10 +26,17 @@ final class AppModel: ObservableObject {
     @Published var playing = false
     @Published var preparingPlay = false
     @Published var waitingRender = false
-    /// 재생 위치 (프로젝트 틱)
-    @Published var playTick = 0
+    /// 재생 위치 (프로젝트 틱). 재생 중에는 1초에 30번 넘게 바뀌어서 발행하지 않고 악보만 다시 그린다
+    /// (발행하면 화면 전체가 그때마다 다시 계산돼서 곡선을 그릴 때 끊긴다).
+    var playTick = 0 { didSet { if playTick != oldValue { playheadChanged() } } }
+    /// 화면 글자용 재생 위치: 0.1초가 바뀔 때만 발행한다.
+    @Published private(set) var playClock = 0
     /// 우클릭으로 고른 재생 시작점 (프로젝트 틱). 스페이스를 누르면 여기서부터.
-    @Published var startTick = 0
+    @Published var startTick = 0 { didSet { if startTick != oldValue { playheadChanged() } } }
+    /// 재생할 때 화면이 재생 위치를 따라 넘어갈지 (기본은 끔: 보던 곳 그대로)
+    @Published var followPlayback = UserDefaults.standard.bool(forKey: "followPlayback") {
+        didSet { UserDefaults.standard.set(followPlayback, forKey: "followPlayback") }
+    }
     @Published var renderProgress: (value: Double, info: String)?
 
     @Published var toast: String?
@@ -45,6 +52,12 @@ final class AppModel: ObservableObject {
     private var toastTask: Task<Void, Never>?
     /// 엔진이 준비되면 열 파일 (앱을 켜면서 연 파일 · AutoTuner에서 넘어온 파일)
     private var pendingOpen: (url: URL, seconds: Double?)?
+    /// 연 파일이 디스크에서 마지막으로 바뀐 때 (열거나 저장한 때). OpenUtau · AutoTuner가 그 뒤에 고쳤는지 보는 데 쓴다.
+    private var fileStamp: Date?
+    private var checkingDisk = false
+    /// 같은 주소가 두 번 들어오는 것 막기 (앱 대리자와 SwiftUI가 둘 다 받을 때가 있다)
+    private var lastURL: (url: URL, at: Date)?
+    private var lastClockTenth = -1
 
     // MARK: 시작 · 끝
 
@@ -110,11 +123,10 @@ final class AppModel: ObservableObject {
         case "playpos":
             let tick = (body["tick"] as? NSNumber)?.intValue ?? playTick
             let isPlaying = body["playing"] as? Bool ?? false
-            waitingRender = body["waiting"] as? Bool ?? false
-            playTick = tick
+            let waiting = isPlaying && (body["waiting"] as? Bool ?? false)
+            if waitingRender != waiting { waitingRender = waiting }
             if playing != isPlaying { playing = isPlaying }
-            if !isPlaying { waitingRender = false }
-            editor?.playheadMoved()
+            playTick = tick
         case "phonemized":
             guard let part = (body["part"] as? NSNumber)?.intValue, let editor, editor.partIndex == part,
                   let phonemes = try? Engine.decode([PhonemeData].self, body["phonemes"]) else { return }
@@ -158,7 +170,7 @@ final class AppModel: ObservableObject {
         let newAxis = TimeAxis(tempos: p.tempos, signatures: p.timeSignatures)
         if newAxis != axis { axis = newAxis }
         if let editor, !p.parts.indices.contains(editor.partIndex) || !p.parts[editor.partIndex].isVoice {
-            closeEditor()
+            dropEditor()  // 되돌리기로 그 파트가 없어짐: 보낼 것은 이미 보냈다
         }
         // 엔진이 알아서 바꾼 것 (예: 한글 가사 → 발음 방식)
         if let notice = reply["notice"] as? String, !notice.isEmpty { show(notice) }
@@ -166,6 +178,8 @@ final class AppModel: ObservableObject {
 
     var isReady: Bool { engineState == .ready }
     var hasUnsavedChanges: Bool { project.map { !$0.saved } ?? false }
+    /// 끌 때 물어볼지: 저장 안 한 것 + 아직 엔진에 안 보낸 것 (입력 중인 가사 · 그리는 중인 곡선)
+    var needsSaveBeforeQuit: Bool { hasUnsavedChanges || editor?.hasPendingEdits == true }
 
     var title: String {
         guard let project else { return "EasyUtau" }
@@ -197,9 +211,10 @@ final class AppModel: ObservableObject {
     func newProject() {
         Task {
             guard await confirmDiscard() else { return }
-            closeEditor()
+            dropEditor()
             stop()
             await command("new", busy: "새 프로젝트를 만드는 중…")
+            fileStamp = nil
             startTick = 0
             playTick = 0
             if let first = project?.parts.first(where: \.isVoice) { openPart(first.index) }
@@ -223,8 +238,12 @@ final class AppModel: ObservableObject {
             pendingOpen = (url, seconds)
             return
         }
-        if project?.path == url.path, !hasUnsavedChanges || seconds != nil {
-            reveal(seconds: seconds)
+        if let path = project?.path, Self.samePath(path, url.path), !hasUnsavedChanges || seconds != nil {
+            // 이미 연 파일 (AutoTuner에서 다시 넘어올 때): 그 사이 다른 앱이 고쳤으면 다시 읽고 그 자리로
+            Task {
+                await checkDisk()
+                reveal(seconds: seconds)
+            }
             return
         }
         Task {
@@ -234,10 +253,14 @@ final class AppModel: ObservableObject {
     }
 
     private func openNow(_ url: URL, seconds: Double?) async {
-        closeEditor()
+        dropEditor()
         stop()
-        guard await command("open", ["path": url.path], busy: "여는 중…") != nil else { return }
+        guard await command("open", ["path": url.path], busy: "여는 중…") != nil else {
+            if !FileManager.default.fileExists(atPath: url.path) { removeRecent(url.path) }
+            return
+        }
         addRecent(url.path)
+        fileStamp = Self.diskStamp(url.path)
         startTick = 0
         playTick = 0
         reveal(seconds: seconds)
@@ -268,7 +291,17 @@ final class AppModel: ObservableObject {
         if project.path.isEmpty || !project.path.lowercased().hasSuffix(".ustx") {
             return await saveAs()
         }
+        // 연 뒤에 OpenUtau · AutoTuner가 이 파일을 고쳤으면 덮어쓰기 전에 묻는다
+        if let stamp = fileStamp, let disk = Self.diskStamp(project.path), disk.timeIntervalSince(stamp) > 0.5 {
+            let alert = NSAlert()
+            alert.messageText = "다른 앱에서 이 파일이 바뀌었어요"
+            alert.informativeText = "\(project.displayName)을(를) 연 뒤에 OpenUtau나 AutoTuner에서 고친 것 같아요. 덮어쓰면 그쪽에서 고친 것은 사라져요."
+            alert.addButton(withTitle: "덮어쓰기")
+            alert.addButton(withTitle: "취소")
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        }
         guard await command("save", ["path": project.path], busy: "저장하는 중…") != nil else { return false }
+        fileStamp = Self.diskStamp(project.path)
         show("저장했어요")
         return true
     }
@@ -286,6 +319,7 @@ final class AppModel: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return false }
         guard await command("save", ["path": url.path], busy: "저장하는 중…") != nil else { return false }
         addRecent(url.path)
+        fileStamp = Self.diskStamp(url.path)
         show("저장했어요")
         return true
     }
@@ -330,6 +364,71 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(recent, forKey: "recent")
     }
 
+    func removeRecent(_ path: String) {
+        recent.removeAll { $0 == path }
+        UserDefaults.standard.set(recent, forKey: "recent")
+    }
+
+    // MARK: 다른 앱과 같은 파일 쓰기
+
+    /// 같은 파일인지 (한글 폴더 이름은 앱마다 글자 조합 방식(NFC · NFD)이 달라서 맞춰서 비교)
+    static func samePath(_ a: String, _ b: String) -> Bool {
+        func norm(_ p: String) -> String {
+            URL(fileURLWithPath: p).standardizedFileURL.path.precomposedStringWithCanonicalMapping
+        }
+        return !a.isEmpty && norm(a) == norm(b)
+    }
+
+    static func diskStamp(_ path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    }
+
+    /// 다른 앱에서 돌아왔을 때 (앱 대리자가 부른다)
+    func becameActive() {
+        refreshAutoTuner()
+        Task { await checkDisk() }
+    }
+
+    /// 연 파일을 OpenUtau · AutoTuner가 고쳤으면 다시 읽는다. 여기서 고친 것이 남아 있으면 먼저 묻는다.
+    func checkDisk() async {
+        guard isReady, !checkingDisk, NSApp.modalWindow == nil, let project, !project.path.isEmpty,
+              project.path.lowercased().hasSuffix(".ustx"),
+              let stamp = fileStamp, let disk = Self.diskStamp(project.path), disk.timeIntervalSince(stamp) > 0.5 else { return }
+        checkingDisk = true
+        defer { checkingDisk = false }
+        await editor?.flush()
+        if hasUnsavedChanges {
+            let alert = NSAlert()
+            alert.messageText = "다른 앱에서 이 파일이 바뀌었어요"
+            alert.informativeText = "\(project.displayName)을(를) OpenUtau나 AutoTuner에서 고친 것 같아요. 여기서 고친 것은 아직 저장하지 않았어요."
+            alert.addButton(withTitle: "바뀐 파일 불러오기")
+            alert.addButton(withTitle: "여기서 고친 것 지키기")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                fileStamp = disk  // 다시 묻지 않는다. 저장하면 덮어쓴다
+                return
+            }
+        }
+        await reloadFromDisk(project.path)
+    }
+
+    /// 같은 파일을 다시 읽는다. 보던 노래 덩어리 · 화면 · 시작점은 그대로.
+    private func reloadFromDisk(_ path: String) async {
+        let part = editor?.partIndex
+        let view = editor?.viewState
+        let start = startTick
+        dropEditor()
+        stop()
+        guard await command("open", ["path": path], busy: "다시 읽는 중…") != nil else { return }
+        fileStamp = Self.diskStamp(path)
+        startTick = start
+        playTick = start
+        if let part, project?.parts[safe: part]?.isVoice == true {
+            openPart(part)
+            if let view { editor?.restore(view) }
+        }
+        show("다른 앱에서 고친 내용을 불러왔어요")
+    }
+
     /// AutoTuner가 만든 결과 (~/Music/AutoTuner/*/project.ustx), 최근 것부터.
     func refreshAutoTuner() {
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/AutoTuner")
@@ -352,25 +451,60 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 지금 프로젝트를 OpenUtau에서 열기 (저장한 파일만)
+    static let openUtauID = "com.stakira.openutau"
+
+    /// 지금 프로젝트를 OpenUtau에서 열기 (저장한 뒤에). OpenUtau는 켤 때 받은 파일만 열고 (파일을 끌어다 주는 건 안 받는다),
+    /// 이미 켜져 있으면 새로 켠 것이 바로 꺼진다. 그래서 켜져 있으면 Finder에서 파일을 보여 준다 (AutoTuner와 같은 방식).
     func openInOpenUtau() {
         guard let path = project?.path, !path.isEmpty else { return }
         Task {
             guard await save() else { return }
-            guard let app = Engine.openUtauApp() else {
+            let file = URL(fileURLWithPath: path)
+            if let running = NSRunningApplication.runningApplications(withBundleIdentifier: Self.openUtauID).first {
+                running.activate()
+                NSWorkspace.shared.activateFileViewerSelecting([file])
+                show("OpenUtau가 이미 열려 있어요. 파일 → 열기로 \(file.lastPathComponent)을(를) 열어 주세요", success: false)
+                return
+            }
+            guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.openUtauID) ?? Engine.openUtauApp() else {
                 show("OpenUtau를 찾지 못했어요", success: false)
                 return
             }
-            NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: app,
-                                    configuration: NSWorkspace.OpenConfiguration()) { _, error in
-                guard error != nil else { return }
-                Task { @MainActor in self.show("OpenUtau를 열지 못했어요", success: false) }
+            if Self.openUtauHasRecovery() {
+                NSWorkspace.shared.activateFileViewerSelecting([file])
+                show("OpenUtau가 먼저 복구할 작업을 물어봐요. 그 창을 닫은 뒤 파일 → 열기로 열어 주세요", success: false)
+            }
+            let config = NSWorkspace.OpenConfiguration()
+            config.arguments = [path]
+            NSWorkspace.shared.openApplication(at: app, configuration: config) { opened, error in
+                Task { @MainActor in
+                    if error != nil {
+                        self.show("OpenUtau를 열지 못했어요", success: false)
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    if let opened, opened.isTerminated {
+                        NSWorkspace.shared.activateFileViewerSelecting([file])
+                        self.show("OpenUtau가 켜지자마자 꺼졌어요. OpenUtau를 직접 연 뒤 파일 → 열기로 열어 주세요", success: false)
+                    }
+                }
             }
         }
     }
 
+    /// OpenUtau에 복구할 작업이 있으면 켤 때 받은 파일을 건너뛴다 (prefs.json의 RecoveryPath).
+    static func openUtauHasRecovery() -> Bool {
+        let prefs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/OpenUtau/prefs.json")
+        guard let data = try? Data(contentsOf: prefs),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let path = json["RecoveryPath"] as? String, !path.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
     /// easyutau://open?path=…&time=초 (AutoTuner에서 음표를 누르면)
     func handle(url: URL) {
+        if let last = lastURL, last.url == url, Date().timeIntervalSince(last.at) < 1.5 { return }
+        lastURL = (url, Date())
         if url.isFileURL {
             open(url)
             return
@@ -388,14 +522,77 @@ final class AppModel: ObservableObject {
     var canUndo: Bool { project?.canUndo ?? false }
     var canRedo: Bool { project?.canRedo ?? false }
 
-    func undo() { Task { await undoRedo("undo") } }
-    func redo() { Task { await undoRedo("redo") } }
+    func undo() { undoOrRedo(redo: false) }
+    func redo() { undoOrRedo(redo: true) }
+
+    /// ⌘Z · ⌘Y · ⌘⇧Z. 글자를 입력하는 중이면 입력한 것을 먼저 넣고 (그것도 한 칸) 되돌린다.
+    func undoOrRedo(redo: Bool) {
+        let ended = endTextEditing()
+        Task {
+            // 입력 칸은 포커스를 잃은 다음 차례에 가사를 넣는다: 그게 먼저 가게 잠깐 기다린다
+            if ended { try? await Task.sleep(nanoseconds: 80_000_000) }
+            await undoRedo(redo ? "redo" : "undo")
+        }
+    }
+
+    /// 메뉴의 되돌리기: 시트(가사 한꺼번에 넣기)에서는 그 글 칸의 되돌리기
+    func undoFromMenu(redo: Bool) {
+        if let w = NSApp.keyWindow, w.sheetParent != nil || w is NSPanel {
+            NSApp.sendAction(Selector(redo ? "redo:" : "undo:"), to: nil, from: nil)
+            return
+        }
+        undoOrRedo(redo: redo)
+    }
+
+    /// 글자 입력 칸(가사 · 빠르기 …)에서 커서를 뺀다. 뺐으면 true.
+    @discardableResult
+    func endTextEditing() -> Bool {
+        guard let w = NSApp.keyWindow, w.sheetParent == nil,
+              let r = w.firstResponder, r is NSTextView || r is NSTextField else { return false }
+        let target: NSView? = editor?.canvas ?? tracksCanvas
+        if let target, target.window === w { w.makeFirstResponder(target) } else { w.makeFirstResponder(nil) }
+        return true
+    }
 
     private func undoRedo(_ cmd: String) async {
         await editor?.flush()
-        guard await command(cmd) != nil else { return }
-        await editor?.reload()
-        show(cmd == "undo" ? "되돌렸어요" : "다시 했어요")
+        guard let reply = await command(cmd) else { return }
+        let undo = cmd == "undo"
+        guard reply["done"] as? Bool ?? true else {
+            show(undo ? "더 되돌릴 게 없어요" : "다시 할 게 없어요", success: false)
+            return
+        }
+        await editor?.reload(keepSelection: true)
+        let what = Self.describe(reply["label"] as? String ?? "")
+        if what.isEmpty {
+            show(undo ? "되돌렸어요" : "다시 했어요")
+        } else {
+            show(undo ? "\(what)\(Self.objectParticle(what)) 되돌렸어요" : "\(what)\(Self.objectParticle(what)) 다시 했어요")
+        }
+    }
+
+    /// OpenUtau 되돌리기 이름 → 쉬운 말
+    static func describe(_ label: String) -> String {
+        let names: [String: String] = [
+            "command.note.add": "섹터 넣기", "command.note.delete": "섹터 지우기", "command.note.move": "섹터 옮기기",
+            "command.note.resize": "길이 바꾸기", "command.note.lyric": "가사 고치기", "command.note.split": "나누기",
+            "command.note.merge": "합치기", "command.note.paste": "붙여 넣기", "command.note.vibrato": "떨림 바꾸기",
+            "command.note.expression": "소리 설정", "command.note.phoneme": "발음 바꾸기", "command.note.edit": "고치기",
+            "command.pitch.draw": "음 높이 그리기", "command.pitch.erase": "음 높이 지우기", "command.pitch.bend": "곡선 밀기",
+            "command.pitch.smooth": "곡선 다듬기", "command.pitch.reset": "음 높이 곡선 지우기",
+            "command.pitch.portamento": "음 넘어가기 바꾸기", "command.curve.edit": "구간 곡선 바꾸기",
+            "command.curve.reset": "구간 곡선 되돌리기", "command.track.add": "트랙 더하기", "command.track.remove": "트랙 지우기",
+            "command.track.edit": "트랙 설정", "command.part.add": "노래 덩어리 더하기", "command.part.remove": "노래 덩어리 지우기",
+            "command.part.edit": "노래 덩어리 옮기기", "command.part.rename": "이름 바꾸기", "command.project.tempo": "빠르기 바꾸기",
+            "command.project.timesig": "박자 바꾸기", "command.import.audio": "소리 파일 넣기",
+        ]
+        return names[label] ?? ""
+    }
+
+    /// 받침이 있으면 "을", 없으면 "를"
+    static func objectParticle(_ word: String) -> String {
+        guard let v = word.unicodeScalars.last?.value, (0xAC00...0xD7A3).contains(v) else { return "을(를)" }
+        return (v - 0xAC00) % 28 == 0 ? "를" : "을"
     }
 
     // MARK: 트랙 · 파트
@@ -411,6 +608,12 @@ final class AppModel: ObservableObject {
     func closeEditor() {
         guard let e = editor else { return }
         Task { await e.flush() }
+        editor = nil
+    }
+
+    /// 편집 화면을 닫되 아직 안 보낸 것은 버린다 (다른 프로젝트를 열 때: 보내면 새 프로젝트를 고쳐 버린다).
+    private func dropEditor() {
+        editor?.invalidate()
         editor = nil
     }
 
@@ -547,7 +750,9 @@ final class AppModel: ObservableObject {
             preparingPlay = true
             defer { preparingPlay = false }
             do {
-                _ = try await engine.send("play", ["tick": max(0, tick)])
+                let reply = try await engine.send("play", ["tick": max(0, tick)])
+                // 발음을 기다리는 사이에 멈추기를 눌렀으면 엔진이 시작하지 않는다
+                guard reply["cancelled"] as? Bool != true else { return }
                 playTick = tick
                 playing = true
             } catch {
@@ -562,16 +767,28 @@ final class AppModel: ObservableObject {
         Task {
             _ = try? await engine.send("stop")
             playTick = startTick
-            editor?.playheadMoved()
         }
     }
 
-    /// 우클릭: 재생 시작점 정하기 (재생 중이면 거기서 다시)
-    func setStart(_ tick: Int) {
+    /// 우클릭: 재생 시작점 정하기. restart면 재생 중일 때 거기서 다시.
+    func setStart(_ tick: Int, restart: Bool = true) {
         startTick = max(0, tick)
-        playTick = startTick
-        if playing { play(from: startTick) }
+        if playing {
+            if restart { play(from: startTick) }
+        } else {
+            playTick = startTick
+        }
+    }
+
+    /// 재생 위치 · 시작점이 바뀜: 악보만 다시 그리고, 시간 글자는 0.1초마다
+    private func playheadChanged() {
         editor?.playheadMoved()
+        tracksCanvas?.needsDisplay = true
+        let tenth = Int((axis.seconds(Double(playing ? playTick : startTick)) * 10).rounded(.down))
+        if tenth != lastClockTenth {
+            lastClockTenth = tenth
+            playClock = playTick
+        }
     }
 
     // MARK: 알림
@@ -593,15 +810,28 @@ final class AppModel: ObservableObject {
 
     /// 앱 전체 키. 처리했으면 true.
     func handle(_ event: NSEvent) -> Bool {
-        // 글자를 입력하는 중(가사 칸 · 이름 칸)에는 건드리지 않는다
-        if let responder = NSApp.keyWindow?.firstResponder, responder is NSTextView || responder is NSTextField {
-            return false
-        }
+        // 시트(가사 한꺼번에) · 알림 창 · 열기 창에서는 그 창이 키를 받는다
+        guard NSApp.modalWindow == nil, let window = event.window, window.sheetParent == nil,
+              window.attachedSheet == nil, !(window is NSPanel) else { return false }
         let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let key = Int(event.keyCode)
+        // ⌘Z · ⌘Y · ⌘⇧Z는 글자를 입력하는 중이어도 (입력한 것을 넣고) 프로젝트 되돌리기
+        if flags.contains(.command), flags.isDisjoint(with: [.option, .control]), key == kVK_ANSI_Z || key == kVK_ANSI_Y {
+            undoOrRedo(redo: key == kVK_ANSI_Y || flags.contains(.shift))
+            return true
+        }
+        // 글자를 입력하는 중(가사 칸 · 이름 칸)에는 나머지 키를 건드리지 않는다. ⌘S만 입력한 것을 넣고 저장.
+        if let responder = window.firstResponder, responder is NSTextView || responder is NSTextField {
+            guard flags == [.command] || flags == [.command, .shift], key == kVK_ANSI_S else { return false }
+            endTextEditing()
+            Task {
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                flags.contains(.shift) ? await saveAs() : await save()
+            }
+            return true
+        }
         if flags.contains(.command) {
             switch key {
-            case kVK_ANSI_Z: flags.contains(.shift) ? redo() : undo()
             case kVK_ANSI_S: Task { flags.contains(.shift) ? await saveAs() : await save() }
             case kVK_ANSI_O: openPanel()
             case kVK_ANSI_N: newProject()

@@ -211,7 +211,7 @@ struct Sidebar: View {
             ForEach(model.autoTunerResults, id: \.path) { url in
                 FileRow(title: url.deletingLastPathComponent().lastPathComponent,
                         detail: "자동 조교 결과 · 눌러서 고치기",
-                        open: model.project?.path == url.path) {
+                        open: AppModel.samePath(model.project?.path ?? "", url.path)) {
                     model.open(url)
                 }
             }
@@ -225,7 +225,7 @@ struct Sidebar: View {
             ForEach(model.recent, id: \.self) { path in
                 FileRow(title: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent,
                         detail: URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent,
-                        open: model.project?.path == path) {
+                        open: AppModel.samePath(model.project?.path ?? "", path)) {
                     model.open(URL(fileURLWithPath: path))
                 }
             }
