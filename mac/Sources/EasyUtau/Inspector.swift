@@ -129,7 +129,7 @@ struct Inspector: View {
             if let one, let id = selected.first?.id {
                 InspectorSection(title: "이 섹터", icon: "textformat") {
                     HStack(spacing: 8) {
-                        LyricBox(text: one.lyric) { editor.setLyric($0, for: id) }
+                        LyricBox(noteID: id, text: one.lyric) { editor.setLyric($1, for: $0) }
                         Text(PitchName.full(one.tone))
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(.secondary)
@@ -232,8 +232,12 @@ struct Inspector: View {
                     }
                 }
             }
-            SmallButton("그린 음 높이 곡선 지우기", icon: "arrow.uturn.backward") { editor.resetPitchOfSelection() }
-                .help("악보에서 끌어 그린 음 높이를 섹터가 만드는 높이로 되돌려요")
+            HStack(spacing: 6) {
+                SmallButton("음 높이 부드럽게", icon: "scribble.variable") { editor.smoothPitchOfSelection() }
+                    .help("고른 섹터의 음 높이 곡선에서 잔떨림을 골라요 (떨림 설정은 그대로). 여러 번 누르면 더 부드러워져요")
+                SmallButton("그린 곡선 지우기", icon: "arrow.uturn.backward") { editor.resetPitchOfSelection() }
+                    .help("악보에서 끌어 그린 음 높이를 섹터가 만드는 높이로 되돌려요")
+            }
         }
     }
 
@@ -479,12 +483,16 @@ struct CurveRow: View {
     }
 }
 
-/// 가사 한 글자를 고치는 칸 (엔터로 넣기).
+/// 가사 한 글자를 고치는 칸 (엔터로 넣기). 입력하던 섹터를 기억해서, 그사이 다른 섹터를 골라도
+/// 입력한 가사는 원래 섹터에 들어간다 (예전에는 새로 고른 섹터에 들어갔다).
 struct LyricBox: View {
+    let noteID: Int
     let text: String
-    let commit: (String) -> Void
+    /// (섹터 id, 가사)
+    let commit: (Int, String) -> Void
 
     @State private var draft = ""
+    @State private var draftFor: Int?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -493,10 +501,31 @@ struct LyricBox: View {
             .font(.system(size: 12, weight: .semibold))
             .frame(width: 92)
             .focused($focused)
-            .onSubmit { commit(draft) }
-            .onChange(of: focused) { _, now in if !now { commit(draft) } }
-            .onAppear { draft = text }
-            .onChange(of: text) { _, now in if !focused { draft = now } }
+            .onSubmit {
+                send()
+                focused = false  // 엔터를 치면 악보 단축키(스페이스 등)가 바로 되게
+            }
+            .onChange(of: focused) { _, now in if !now { send() } }
+            .onAppear {
+                draft = text
+                draftFor = noteID
+            }
+            .onChange(of: noteID) { _, now in
+                if focused { send() }
+                draft = text
+                draftFor = now
+            }
+            .onChange(of: text) { _, now in
+                if !focused {
+                    draft = now
+                    draftFor = noteID
+                }
+            }
+    }
+
+    private func send() {
+        guard let id = draftFor else { return }
+        commit(id, draft)
     }
 }
 

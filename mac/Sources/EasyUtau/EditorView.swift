@@ -142,11 +142,13 @@ struct EditorView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 92, alignment: .leading)
 
+            FollowToggle(model: model)
+
             divider
 
             Picker("", selection: $editor.tool) {
                 Image(systemName: "music.note").help("섹터: 빈 곳을 누르면 새 섹터, 끌면 옮기기 (1)").tag(PartEditor.Tool.note)
-                Image(systemName: "scribble").help("음 높이: 끌어서 곡선 그리기 (2)").tag(PartEditor.Tool.pitch)
+                Image(systemName: "scribble").help("음 높이: 끌어서 곡선 그리기, ⌥ 끌기로 곡선 밀기 (2)").tag(PartEditor.Tool.pitch)
                 Image(systemName: "eraser").help("지우개: 그린 곡선 지우기, 섹터는 눌러서 지우기 (3)").tag(PartEditor.Tool.erase)
             }
             .pickerStyle(.segmented)
@@ -181,7 +183,7 @@ struct EditorView: View {
             CircleIconButton(icon: "arrow.uturn.backward", help: "되돌리기 (⌘Z)", size: 26) { model.undo() }
                 .disabled(!model.canUndo)
                 .opacity(model.canUndo ? 1 : 0.4)
-            CircleIconButton(icon: "arrow.uturn.forward", help: "다시 하기 (⌘⇧Z)", size: 26) { model.redo() }
+            CircleIconButton(icon: "arrow.uturn.forward", help: "다시 하기 (⌘Y)", size: 26) { model.redo() }
                 .disabled(!model.canRedo)
                 .opacity(model.canRedo ? 1 : 0.4)
             CircleIconButton(icon: "minus.magnifyingglass", help: "좁게 보기 (⌘-)", size: 26) { editor.zoom(1 / 1.4) }
@@ -191,7 +193,7 @@ struct EditorView: View {
     }
 
     private var timeText: String {
-        let play = model.axis.seconds(Double(model.playTick))
+        let play = model.axis.seconds(Double(model.playClock))
         let start = model.axis.seconds(Double(model.startTick))
         if model.playing || model.preparingPlay {
             return formatTime(play, tenths: true) + (model.waitingRender ? " · 준비 중" : "")
@@ -224,13 +226,14 @@ struct EditorView: View {
             switch editor.tool {
             case .note:
                 KeyHint("클릭", "그 음 높이에 새 섹터")
-                KeyHint("끌기", "옮기기 · 오른쪽 끝은 길이")
+                KeyHint("끌기", "옮기기 · 오른쪽 끝은 길이 · 빈 곳은 음 높이")
                 KeyHint("더블클릭", "가사")
                 KeyHint("우클릭", "여기서부터 재생")
                 KeyHint("Space", "들어 보기")
                 KeyHint("↑ ↓", "반음 (⇧ 옥타브)")
             case .pitch:
-                KeyHint("끌기", "음 높이 곡선 그리기")
+                KeyHint("끌기", "그린 곳 그대로 음 높이")
+                KeyHint("⌥ 끌기", "곡선 잡아 밀기")
                 KeyHint("우클릭", "여기서부터 재생")
                 KeyHint("3", "지우개")
                 KeyHint("1", "섹터로 돌아가기")
@@ -239,7 +242,7 @@ struct EditorView: View {
                 KeyHint("클릭", "섹터 지우기")
                 KeyHint("1", "섹터로 돌아가기")
             }
-            KeyHint("⌘Z", "되돌리기")
+            KeyHint("⌘Z · ⌘Y", "되돌리기 · 다시")
             Spacer(minLength: 0)
             if let warning = model.audioWarning {
                 Label(warning, systemImage: "speaker.slash")
@@ -249,6 +252,28 @@ struct EditorView: View {
             }
         }
         .lineLimit(1)
+    }
+}
+
+/// 재생할 때 화면이 재생 위치를 따라갈지 (트랙 화면 · 편집 화면이 같이 쓴다)
+struct FollowToggle: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button { model.followPlayback.toggle() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: model.followPlayback ? "arrow.right.to.line.compact" : "pin")
+                Text(model.followPlayback ? "따라가기" : "화면 고정")
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(model.followPlayback ? Color.white : Color.primary)
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(model.followPlayback ? AnyShapeStyle(Color.easy.gradient) : AnyShapeStyle(Color.primary.opacity(0.06))))
+        }
+        .buttonStyle(PressableStyle())
+        .help(model.followPlayback ? "재생할 때 화면이 재생 위치를 따라 넘어가요. 누르면 보던 곳 그대로 있어요"
+                                   : "재생해도 화면은 보던 곳 그대로예요. 누르면 재생 위치를 따라 넘어가요")
     }
 }
 

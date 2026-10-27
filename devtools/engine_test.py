@@ -223,6 +223,45 @@ def main():
         print(f"저장 · 다시 열기 좋아요 ({path.stat().st_size}바이트, 섹터 {len(notes2)}개)")
         result["ustx_bytes"] = path.stat().st_size
 
+        # "저장됨" 표시: 고치면 꺼지고, ⌘Z로 저장한 때까지 되돌리면 다시 켜진다
+        assert reopened["saved"], "막 연 파일이 저장 안 함으로 보여요"
+        changed = [dict(n) for n in notes2]
+        changed[0]["lyric"] = changed[1]["lyric"]
+        r = e.send("setPart", part=part2["index"], notes=changed, curves=[], label="command.note.lyric")
+        assert not r["project"]["saved"], "고쳤는데 저장됨으로 보여요"
+        r = e.send("undo")
+        assert r["done"] and r["label"] == "command.note.lyric", r.get("label")
+        assert r["project"]["saved"], "저장한 때까지 되돌렸는데 저장 안 함으로 보여요"
+        r = e.send("redo")
+        assert r["done"] and not r["project"]["saved"]
+        e.send("undo")
+        r = e.send("undo")
+        assert not r["done"] and r["project"]["saved"], "되돌릴 것이 없는데 무언가 되돌렸어요"
+        print("저장됨 표시 · 되돌릴 것 없음 좋아요")
+
+        # AutoTuner와 같은 파일 쓰기: AutoTuner(파이썬 yaml)가 읽고 고쳐 쓴 파일을 다시 연다
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+            print("pyyaml이 없어서 AutoTuner 호환 확인은 건너뛰어요")
+        if yaml:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            vp = data["voice_parts"][0]
+            assert float(data["tempos"][0]["bpm"]) > 0
+            assert all({"position", "duration", "tone", "lyric"} <= set(n) for n in vp["notes"])
+            assert [n["lyric"] for n in vp["notes"]] == [n["lyric"] for n in made]
+            vp["notes"][0]["lyric"] = "+"
+            edited = work / "autotuner-edited.ustx"
+            edited.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            again = e.send("open", path=str(edited))["project"]
+            part3 = next(p for p in again["parts"] if p["kind"] == "voice")
+            notes3 = e.send("part", part=part3["index"])["part"]["notes"]
+            assert notes3[0]["lyric"] == "+" and len(notes3) == len(made)
+            print("AutoTuner가 읽고 고쳐 쓴 파일 다시 열기 좋아요")
+            result["autotuner_compat"] = True
+            e.send("open", path=str(path))
+
         # 내보내기: 실제로 테토가 부른 소리가 들어 있는지 (파일은 올리지 않는다)
         wav = work / "test.wav"
         e.send("export", path=str(wav), timeout=600)
