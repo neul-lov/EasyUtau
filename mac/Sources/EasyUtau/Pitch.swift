@@ -15,18 +15,32 @@ enum PitchMath {
         }
     }
 
-    /// UNote.Validate의 snapFirst: 앞 음표에 딱 붙어 있으면 첫 점은 앞 음표 높이에서 시작.
+    /// UNote.Validate의 snapFirst: 앞 음표에 딱 붙어 있으면 첫 점은 앞 음표 높이에서 시작
+    /// (AdjustedTone이라 미세 조정(tuning)까지 맞춘다).
     static func snapped(_ notes: [NoteData], _ k: Int, defaults: EngineDefaults) -> [PitchPointData] {
         let n = notes[k]
         var data = n.pitch?.data ?? defaultPoints(defaults)
         if n.pitch?.snapFirst ?? true, !data.isEmpty {
             if k > 0, notes[k - 1].end == n.position {
-                data[0].y = Double(notes[k - 1].tone - n.tone) * 10
+                data[0].y = (PitchPoints.cents(notes[k - 1]) - PitchPoints.cents(n)) / 10
             } else {
                 data[0].y = 0
             }
         }
         return data
+    }
+
+    /// SplineInterpolate.CubicSplineSegment (Catmull-Rom): 점 모양 "매끄럽게"(sp). x0~x1 사이 값.
+    static func spline(_ xm: Double, _ ym: Double, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double,
+                       _ x2: Double, _ y2: Double, _ x: Double) -> Double {
+        if x <= x0 { return y0 }
+        if x >= x1 { return y1 }
+        let m0 = (y1 - ym) * (x1 - x0) / max(1e-9, x1 - xm)
+        let m1 = (y2 - y0) * (x1 - x0) / max(1e-9, x2 - x0)
+        let a = 2 * y0 - 2 * y1 + m0 + m1
+        let b = -3 * y0 + 3 * y1 - 2 * m0 - m1
+        let t = (x - x0) / (x1 - x0)
+        return ((a * t + b) * t + m0) * t + y0
     }
 
     /// 새 음표의 피치 점 (OpenUtau 기본 포르타멘토).
@@ -84,25 +98,32 @@ enum PitchMath {
                 }
             }
         }
-        // 피치 점
+        // 피치 점 (auto: 음표 시작 · 끝까지 늘이려고 넣은 점)
+        typealias Knot = (x: Double, y: Double, shape: PitchShape, auto: Bool)
         for (k, n) in notes.enumerated() {
             let tone = Double(n.tone * 100 + n.tuning)
             let posMs = axis.ms(Double(partPosition + n.position))
-            var pts = snapped(notes, k, defaults: defaults).map { p -> (x: Double, y: Double, shape: PitchShape) in
-                (axis.tick(ms: posMs + p.x) - Double(partPosition), p.y * 10 + tone, p.shape)
+            let raw = snapped(notes, k, defaults: defaults)
+            var pts = raw.map { p -> Knot in
+                (axis.tick(ms: posMs + p.x) - Double(partPosition), p.y * 10 + tone, p.shape, false)
             }
-            if pts.isEmpty { pts = [(Double(n.position), tone, .io), (Double(n.end), tone, .io)] }
-            if pts[0].x > Double(n.position) { pts.insert((Double(n.position), pts[0].y, .io), at: 0) }
-            if pts[pts.count - 1].x < Double(n.end) { pts.append((Double(n.end), pts[pts.count - 1].y, .io)) }
+            if pts.isEmpty { pts = [(Double(n.position), tone, .io, true), (Double(n.end), tone, .io, true)] }
+            if pts[0].x > Double(n.position) { pts.insert((Double(n.position), pts[0].y, .io, true), at: 0) }
+            if pts[pts.count - 1].x < Double(n.end) { pts.append((Double(n.end), pts[pts.count - 1].y, .io, true)) }
             let prevEnd = k > 0 ? Double(notes[k - 1].end) : -Double.infinity
             let prevTone = k > 0 ? Double(notes[k - 1].tone * 100 + notes[k - 1].tuning) : tone
             var i = max(0, Int(floor((pts[0].x - Double(from)) / Double(step))))
             for s in 0..<(pts.count - 1) {
                 let p0 = pts[s], p1 = pts[s + 1]
+                // 매끄럽게(sp): 점이 셋 이상이고 다음 점이 늘인 점이 아닐 때 (RenderPhrase와 같다)
+                let curve = raw.count > 2 && p0.shape == .sp && !p1.auto
+                let pm = s == 0 ? p0 : pts[s - 1]
+                let p2 = s >= pts.count - 2 ? p1 : pts[s + 2]
                 var x = Double(from + i * step)
                 while x < p1.x && i < count {
                     if x >= Double(from) {
-                        let pitch = interpolate(p0.x, p1.x, p0.y, p1.y, x, p0.shape)
+                        let pitch = curve ? spline(pm.x, pm.y, p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, x)
+                                          : interpolate(p0.x, p1.x, p0.y, p1.y, x, p0.shape)
                         let basePitch = x < prevEnd ? prevTone : tone
                         if !out[i].isNaN { out[i] += pitch - basePitch }
                     }
@@ -306,6 +327,14 @@ struct PitchSketch {
         return v.isNaN ? 6000 : v
     }
 
+    /// ⇧ 직선: 지금까지 그린 것을 버리고 a에서 b까지 곧게
+    mutating func line(from a: (tick: Double, cents: Double), to b: (tick: Double, cents: Double)) {
+        drawn = [:]
+        last = nil
+        add(tick: a.tick, cents: a.cents)
+        add(tick: b.tick, cents: b.cents)
+    }
+
     mutating func add(tick: Double, cents: Double) {
         if let last {
             // 지난 점에서 여기까지 (거꾸로 그어도) 사이 칸을 모두 채운다: 나중에 그은 것이 이긴다
@@ -362,29 +391,6 @@ struct PitchSketch {
         }
         var c = original
         CurveMath.replace(&c, from: lo - e, to: hi + e, with: points)
-        return c
-    }
-}
-
-/// ⌥ 끌기: 곡선을 한 점에서 잡아 위아래로 민다. 둘레(radius 틱)는 종 모양으로 덜 움직인다.
-struct PitchBend {
-    let original: CurveData
-    let center: Int
-    let radius: Int
-
-    func result(delta: Double) -> CurveData {
-        let a = CurveMath.snap(Double(center - radius)), b = CurveMath.snap(Double(center + radius))
-        var points: [(x: Int, y: Int)] = []
-        var x = a
-        while x <= b {
-            let u = min(1, abs(Double(x - center)) / Double(max(1, radius)))
-            let w = (1 + cos(.pi * u)) / 2
-            let v = Double(CurveMath.sample(original, x)) + delta * w
-            points.append((x, max(-1200, min(1200, Int(v.rounded())))))
-            x += CurveMath.interval
-        }
-        var c = original
-        CurveMath.replace(&c, from: a, to: b, with: points)
         return c
     }
 }

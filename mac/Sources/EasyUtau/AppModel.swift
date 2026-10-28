@@ -38,6 +38,10 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(followPlayback, forKey: "followPlayback") }
     }
     @Published var renderProgress: (value: Double, info: String)?
+    /// 반복해서 듣는 곳 (프로젝트 틱): 재생이 끝에 닿으면 처음으로 돌아간다 (⌥Space · 편집 화면의 반복 단추)
+    @Published var loopRange: Range<Int>?
+    /// 반복하려고 다시 재생하는 중 (그사이 재생 위치 알림으로 또 다시 시작하지 않게)
+    private var restartingLoop = false
 
     @Published var toast: String?
     @Published var toastIsSuccess = true
@@ -124,8 +128,13 @@ final class AppModel: ObservableObject {
             let tick = (body["tick"] as? NSNumber)?.intValue ?? playTick
             let isPlaying = body["playing"] as? Bool ?? false
             let waiting = isPlaying && (body["waiting"] as? Bool ?? false)
+            // 반복: 끝에 닿았거나 노래가 먼저 끝났으면 처음으로 (멈추기를 누른 것은 playing이 이미 false)
+            if let r = loopRange, playing, !restartingLoop, !isPlaying || tick >= r.upperBound {
+                restartLoop()
+                return
+            }
             if waitingRender != waiting { waitingRender = waiting }
-            if playing != isPlaying { playing = isPlaying }
+            if playing != isPlaying, !restartingLoop { playing = isPlaying }
             playTick = tick
         case "phonemized":
             guard let part = (body["part"] as? NSNumber)?.intValue, let editor, editor.partIndex == part,
@@ -580,6 +589,11 @@ final class AppModel: ObservableObject {
             "command.note.expression": "소리 설정", "command.note.phoneme": "발음 바꾸기", "command.note.edit": "고치기",
             "command.pitch.draw": "음 높이 그리기", "command.pitch.erase": "음 높이 지우기", "command.pitch.bend": "곡선 밀기",
             "command.pitch.smooth": "곡선 다듬기", "command.pitch.reset": "음 높이 곡선 지우기",
+            "command.pitch.point": "음 높이 점 바꾸기", "command.pitch.shape": "점 사이 모양 바꾸기",
+            "command.pitch.snap": "앞 섹터와 잇기 · 끊기", "command.pitch.preset": "음 높이 모양 넣기",
+            "command.pitch.pointreset": "음 높이 점 처음대로", "command.pitch.scale": "흔들림 바꾸기",
+            "command.pitch.center": "음 중심 맞추기", "command.note.pasteparams": "설정 붙여 넣기",
+            "command.note.duplicate": "섹터 복제",
             "command.pitch.portamento": "음 넘어가기 바꾸기", "command.curve.edit": "구간 곡선 바꾸기",
             "command.curve.reset": "구간 곡선 되돌리기", "command.track.add": "트랙 더하기", "command.track.remove": "트랙 지우기",
             "command.track.edit": "트랙 설정", "command.part.add": "노래 덩어리 더하기", "command.part.remove": "노래 덩어리 지우기",
@@ -609,12 +623,14 @@ final class AppModel: ObservableObject {
         guard let e = editor else { return }
         Task { await e.flush() }
         editor = nil
+        loopRange = nil
     }
 
     /// 편집 화면을 닫되 아직 안 보낸 것은 버린다 (다른 프로젝트를 열 때: 보내면 새 프로젝트를 고쳐 버린다).
     private func dropEditor() {
         editor?.invalidate()
         editor = nil
+        loopRange = nil
     }
 
     func addTrack() {
@@ -738,9 +754,48 @@ final class AppModel: ObservableObject {
 
     // MARK: 재생
 
-    /// 스페이스: 재생 중이면 멈추고, 아니면 고른 시작점부터.
+    /// 스페이스: 재생 중이면 멈추고, 아니면 고른 시작점부터 (반복 듣기 중이면 반복하는 곳 처음부터).
     func togglePlay() {
-        if playing || preparingPlay { stop() } else { play(from: startTick) }
+        if playing || preparingPlay { stop() } else { play(from: loopRange?.lowerBound ?? startTick) }
+    }
+
+    /// ⌥Space: 고른 섹터를 반복해서 듣기 (켜면 바로 재생). 다시 누르면 끈다.
+    func toggleLoop() {
+        if loopRange != nil {
+            loopRange = nil
+            show("반복 듣기를 껐어요")
+            return
+        }
+        guard let e = editor, let a = e.selected.map(\.n.position).min(), let b = e.selected.map(\.n.end).max() else {
+            show("반복해서 들을 섹터를 먼저 골라 주세요", success: false)
+            return
+        }
+        // 앞뒤로 조금 더 (앞 섹터에서 넘어오는 곳 · 끝나는 소리까지)
+        let lo = max(0, e.position + a - 240)
+        var hi = e.position + b + 120
+        if let end = project?.endTick, end > lo + 120 { hi = min(hi, end) }
+        guard hi > lo + 60 else { return }
+        loopRange = lo..<hi
+        play(from: lo)
+        show("고른 곳을 반복해서 들어요 (⌥Space로 끄기)")
+    }
+
+    private func restartLoop() {
+        guard let r = loopRange, !restartingLoop else { return }
+        restartingLoop = true
+        Task {
+            defer { restartingLoop = false }
+            do {
+                let reply = try await engine.send("play", ["tick": r.lowerBound])
+                guard reply["cancelled"] as? Bool != true else { return }
+                playTick = r.lowerBound
+                playing = true
+            } catch {
+                loopRange = nil
+                playing = false
+                show(error.localizedDescription, success: false)
+            }
+        }
     }
 
     func play(from tick: Int) {
@@ -845,6 +900,10 @@ final class AppModel: ObservableObject {
         }
         if key == kVK_Space, flags.isEmpty {
             togglePlay()
+            return true
+        }
+        if key == kVK_Space, flags == [.option], editor != nil {
+            toggleLoop()
             return true
         }
         if key == kVK_Escape, editor != nil, editor?.selection.isEmpty == true {

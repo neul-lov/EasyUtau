@@ -74,13 +74,15 @@ final class PianoRollView: NSView {
         case ruler
         /// 빈 곳을 누름: 그대로 떼면 새 섹터, 끌면 음 높이 곡선
         case pending(start: NSPoint)
-        case move(anchor: Int, origin: [Int: NoteData], start: NSPoint, lastTone: Int)
+        /// 섹터 옮기기. copy: ⌥ 끌어 복제한 섹터들과 복제 전 선택 (안 끌고 떼면 없앤다)
+        case move(anchor: Int, origin: [Int: NoteData], start: NSPoint, lastTone: Int, copy: (ids: Set<Int>, before: Set<Int>)?)
         case resize(anchor: Int, origin: [Int: NoteData], start: NSPoint)
         case band(start: NSPoint, current: NSPoint, base: Set<Int>)
         /// 펜으로 곡선 긋기 (조금이라도 움직여야 그린다: 그냥 누르면 아무것도 안 바뀐다)
         case pitch(start: NSPoint, moved: Bool)
-        /// ⌥ 끌기: 곡선을 잡아 위아래로 밀기
-        case bend(start: NSPoint)
+        /// 음 높이 점 끌기: 잡은 곳에서 곡선이 접힌다. at: 누른 곳 (틱, 반음: 화면이 넘어가도 맞게),
+        /// shown: 잡았을 때 보이던 높이 (센트, ⌘ 반음 맞추기에 쓴다)
+        case point(grab: PartEditor.PointGrab, start: NSPoint, at: (tick: Double, tone: Double), shown: Double, moved: Bool)
         case erase(lastTick: Double, downNote: Int?, moved: Bool)
     }
 
@@ -88,6 +90,37 @@ final class PianoRollView: NSView {
     private var changed = false
     private var heldKey: Int?
     private var hover: NSPoint?
+
+    /// 악보에 보이는 음 높이 점
+    private struct Dot {
+        let noteID: Int
+        let index: Int
+        let at: CGPoint
+        /// 보이는 높이 (센트)
+        let cents: Double
+        /// 높이를 못 바꾸는 점 (옆으로만)
+        let locked: Bool
+    }
+
+    /// 섹터 사이 이음 표시 (누르면 잇기 · 끊기)
+    private struct Badge {
+        /// 뒤 섹터
+        let noteID: Int
+        let center: CGPoint
+        let attached: Bool
+    }
+
+    /// 마지막으로 그린 음 높이 선: from 틱부터 step 간격 센트 (선이 없는 곳은 nan). 점 찾기 · 누르기에 쓴다.
+    private var line: (from: Int, step: Int, cents: [Double])?
+    private var dots: [Dot] = []
+    private var badges: [Badge] = []
+    private var hoverDot: (noteID: Int, index: Int)?
+    private var hoverBadge: Int?
+    /// 선 위에 마우스: 누르면 점이 생길 곳
+    private var hoverInsert: CGPoint?
+    /// 마우스 옆 작은 글 (높이 · 할 수 있는 것)
+    private var readout: String?
+    private var symbolCache: [String: NSImage] = [:]
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -211,6 +244,15 @@ final class PianoRollView: NSView {
             }
         }
 
+        // 반복해서 듣는 곳
+        if let r = model?.loopRange {
+            let a = max(keyW, x(Double(r.lowerBound - e.position))), b = min(w, x(Double(r.upperBound - e.position)))
+            if b > a {
+                ctx.setFillColor(NSColor.easy.withAlphaComponent(0.06).cgColor)
+                ctx.fill(CGRect(x: a, y: rulerH, width: b - a, height: bottom - rulerH))
+            }
+        }
+
         // 마디 · 박 · 격자 선
         drawGrid(e, ctx, t0: t0, t1: t1, top: rulerH, bottom: bottom)
 
@@ -273,8 +315,12 @@ final class PianoRollView: NSView {
             }
         }
 
+        // 음 높이 점 · 섹터 사이 이음 표시
+        drawPointsAndBadges(e, ctx, t0: t0, t1: t1)
+
         // 빈 곳에 마우스: 누르면 생길 섹터를 점선으로
-        if e.tool == .note, case .none = drag, let hp = hover, let ht = hoverTone, hit(hp) == nil, lyricNote == nil {
+        if e.tool == .note, case .none = drag, let hp = hover, let ht = hoverTone, hit(hp) == nil, lyricNote == nil,
+           hoverBadge == nil {
             let start = Double(max(0, e.snapDown(tick(hp.x))))
             let r = CGRect(x: x(start), y: rowTop(ht) + 1, width: max(6, x(start + Double(e.newLength)) - x(start)),
                            height: max(2, rh - 2))
@@ -340,6 +386,8 @@ final class PianoRollView: NSView {
                 ctx.fill(CGRect(x: px - 0.75, y: rulerH - 6, width: 1.5, height: h - rulerH + 6))
             }
         }
+
+        drawReadout(ctx)
     }
 
     private func drawGrid(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double, top: CGFloat, bottom: CGFloat) {
@@ -370,46 +418,73 @@ final class PianoRollView: NSView {
     }
 
     /// 실제로 부르는 높이: 섹터 높이 + 넘어가는 모양 + 떨림 + 그린 곡선 (OpenUtau와 같은 계산).
-    /// 곡선을 그리는 중이면 원래 선은 흐리게 함께 보여 준다.
+    /// 고치는 중이면 원래 선은 흐리게 함께 보여 준다.
     private func drawPitchLine(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double) {
-        if e.pitchDraft != nil {
-            drawPitchLine(e, ctx, t0: t0, t1: t1, pitd: e.curves["pitd"], faint: true)
+        let strong = e.tool != .note
+        if e.pitchDraft != nil || e.pointDraft != nil,
+           let before = pitchLine(e, notes: e.orderedNotes.map(\.n), pitd: e.curves["pitd"], t0: t0, t1: t1) {
+            stroke(before.path, ctx, faint: true, strong: strong)
         }
-        drawPitchLine(e, ctx, t0: t0, t1: t1, pitd: e.shownPitd, faint: false)
+        guard let now = pitchLine(e, notes: e.shownNotes.map(\.n), pitd: e.shownPitd, t0: t0, t1: t1) else {
+            line = nil
+            return
+        }
+        line = (now.from, now.step, now.cents)
+        stroke(now.path, ctx, faint: false, strong: strong)
     }
 
-    private func drawPitchLine(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double, pitd: CurveData?, faint: Bool) {
-        let notes = e.datas.sorted { ($0.position, $0.tone) < ($1.position, $1.tone) }
-        guard !notes.isEmpty else { return }
+    /// 보이는 곳의 음 높이 선. 섹터가 있는 곳만 그린다: 앞 섹터에서 이어 부르면 이어지는 곳부터 (틈을 건너는 곳도),
+    /// 앞 섹터와 끊긴 곳은 선도 끊는다.
+    private func pitchLine(_ e: PartEditor, notes: [NoteData], pitd: CurveData?, t0: Double, t1: Double)
+        -> (path: CGPath, from: Int, step: Int, cents: [Double])? {
+        guard !notes.isEmpty else { return nil }
         let step = max(5, Int((2 / e.pxPerTick).rounded()) / 5 * 5)
         let from = (Int(t0.rounded(.down)) / step - 1) * step
         let to = Int(t1) + step
         let count = (to - from) / step + 1
         guard count > 1,
               let first = notes.firstIndex(where: { $0.end >= from - 960 }),
-              let last = notes.lastIndex(where: { $0.position <= to + 960 }), last >= first else { return }
-        let sub = Array(notes[max(0, first - 1)...min(notes.count - 1, last + 1)])
+              let last = notes.lastIndex(where: { $0.position <= to + 960 }), last >= first else { return nil }
+        let lo = max(0, first - 1), hi = min(notes.count - 1, last + 1)
+        let sub = Array(notes[lo...hi])
         var cents = PitchMath.base(sub, axis: e.axis, partPosition: e.position, from: from, step: step, count: count,
                                    vibrato: true, defaults: e.defaults)
         if let pitd, !pitd.xs.isEmpty {
             for i in 0..<count { cents[i] += Double(CurveMath.sample(pitd, from + i * step)) }
         }
-        // 섹터가 있는 곳만 (앞 섹터와 떨어진 섹터는 조금 앞에서부터: 넘어오는 모양)
         var covered = [Bool](repeating: false, count: count)
-        for n in sub {
-            let a = max(0, Int(ceil(Double(n.position - 60 - from) / Double(step))))
+        var breaks = Set<Int>()
+        for k in lo...hi {
+            let n = notes[k]
+            var start = Double(n.position)
+            let attached = PitchPoints.isAttached(notes, k, axis: e.axis, partPosition: e.position, defaults: e.defaults)
+            if attached, let f = PitchPoints.effective(notes, k, defaults: e.defaults).data.first {
+                start = min(start, PitchPoints.tick(f.x, of: n, axis: e.axis, partPosition: e.position))
+            }
+            let a = max(0, Int(ceil((start - Double(from)) / Double(step))))
             let b = min(count - 1, Int(floor(Double(n.end - from) / Double(step))))
             if a <= b { for i in a...b { covered[i] = true } }
+            if k > 0, notes[k - 1].end == n.position, !attached {
+                let i = Int(ceil(Double(n.position - from) / Double(step)))
+                if i >= 0 && i < count { breaks.insert(i) }
+            }
         }
         let path = CGMutablePath()
         var open = false
         for i in 0..<count {
-            guard covered[i], !cents[i].isNaN else { open = false; continue }
+            guard covered[i], !cents[i].isNaN else {
+                cents[i] = .nan
+                open = false
+                continue
+            }
             let p = CGPoint(x: x(Double(from + i * step)), y: y(cents: cents[i]))
-            if open { path.addLine(to: p) } else { path.move(to: p) }
+            if open && !breaks.contains(i) { path.addLine(to: p) } else { path.move(to: p) }
             open = true
         }
-        let strong = e.tool != .note
+        return (path, from, step, cents)
+    }
+
+    private func stroke(_ path: CGPath, _ ctx: CGContext, faint: Bool, strong: Bool) {
         ctx.saveGState()
         ctx.clip(to: CGRect(x: keyW, y: rulerH, width: bounds.width - keyW, height: gridBottom - rulerH))
         ctx.setLineJoin(.round)
@@ -432,6 +507,171 @@ final class PianoRollView: NSView {
         ctx.setLineWidth(strong ? 2.2 : 1.6)
         ctx.strokePath()
         ctx.restoreGState()
+    }
+
+    /// 그린 선의 높이 (센트) at 파트 틱. 선이 없는 곳은 nil.
+    private func lineCents(at t: Double) -> Double? {
+        guard let line, line.cents.count > 1 else { return nil }
+        let u = (t - Double(line.from)) / Double(line.step)
+        let i = Int(floor(u))
+        guard i >= 0, i + 1 < line.cents.count else { return nil }
+        let a = line.cents[i], b = line.cents[i + 1]
+        if a.isNaN && b.isNaN { return nil }
+        if a.isNaN { return b }
+        if b.isNaN { return a }
+        return a + (b - a) * (u - Double(i))
+    }
+
+    /// 그 x의 음 높이 선 y
+    private func lineY(atX px: CGFloat) -> CGFloat? {
+        lineCents(at: tick(px)).map { y(cents: $0) }
+    }
+
+    /// 음 높이 점(음 높이 도구) · 섹터 사이 이음 표시 (음 높이 도구는 모두, 섹터 도구는 고른 섹터 둘레만)
+    private func drawPointsAndBadges(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double) {
+        let shown = e.shownNotes
+        let datas = shown.map(\.n)
+        dots = []
+        badges = []
+        guard !datas.isEmpty else { return }
+        let first = datas.firstIndex { Double($0.end) > t0 - 960 } ?? datas.count
+        let last = datas.lastIndex { Double($0.position) < t1 + 960 } ?? -1
+        guard first <= last else { return }
+        if e.tool == .pitch {
+            for k in first...last {
+                let n = datas[k]
+                guard x(Double(n.end)) - x(Double(n.position)) >= 14 else { continue }
+                let pd = PitchPoints.effective(datas, k, defaults: e.defaults)
+                for (i, pt) in pd.data.enumerated() {
+                    let t = PitchPoints.tick(pt.x, of: n, axis: e.axis, partPosition: e.position)
+                    guard t >= t0 - 40, t <= t1 + 40 else { continue }
+                    let c = lineCents(at: t)
+                        ?? PitchPoints.cents(n) + pt.y * 10 + Double(CurveMath.sample(e.shownPitd, CurveMath.snap(t)))
+                    dots.append(Dot(noteID: shown[k].id, index: i, at: CGPoint(x: x(t), y: y(cents: c)), cents: c,
+                                    locked: PitchPoints.heightLocked(datas, k, index: i, axis: e.axis,
+                                                                     partPosition: e.position, defaults: e.defaults)))
+                }
+            }
+        }
+        for k in max(1, first)...max(1, last) where k < datas.count {
+            let p = datas[k - 1], n = datas[k]
+            guard e.tool == .pitch || e.selection.contains(shown[k].id) || e.selection.contains(shown[k - 1].id),
+                  PitchPoints.previous(datas, k, axis: e.axis, partPosition: e.position) != nil else { continue }
+            // 너무 좁으면 그리지 않는다 (넓혀 보면 나온다)
+            guard min(x(Double(p.end)) - x(Double(p.position)), x(Double(n.end)) - x(Double(n.position))) >= 22 else { continue }
+            let jx = x((Double(p.end) + Double(n.position)) / 2)
+            guard jx > keyW + 6, jx < bounds.width - 6 else { continue }
+            var cy = rowTop(max(p.tone, n.tone)) - 10
+            if cy < rulerH + 10 { cy = rowTop(min(p.tone, n.tone)) + (editor?.rowHeight ?? 20) + 10 }
+            guard cy < gridBottom - 8 else { continue }
+            badges.append(Badge(noteID: shown[k].id, center: CGPoint(x: jx, y: cy),
+                                attached: PitchPoints.isAttached(datas, k, axis: e.axis, partPosition: e.position,
+                                                                 defaults: e.defaults)))
+        }
+
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: keyW, y: rulerH, width: bounds.width - keyW, height: gridBottom - rulerH))
+        var grabbed: (Int, Int)?
+        if case let .point(g, _, _, _, _) = drag { grabbed = (g.noteID, g.index) }
+        for d in dots {
+            let big = (hoverDot.map { $0.noteID == d.noteID && $0.index == d.index } ?? false)
+                || (grabbed.map { $0.0 == d.noteID && $0.1 == d.index } ?? false)
+            let r: CGFloat = big ? 5 : 3.6
+            let rect = CGRect(x: d.at.x - r, y: d.at.y - r, width: 2 * r, height: 2 * r)
+            if d.locked {
+                ctx.setFillColor(NSColor.textBackgroundColor.cgColor)
+                ctx.fillEllipse(in: rect)
+                ctx.setStrokeColor(NSColor.pitchLine.cgColor)
+                ctx.setLineWidth(1.5)
+                ctx.strokeEllipse(in: rect.insetBy(dx: 0.75, dy: 0.75))
+            } else {
+                ctx.setFillColor(NSColor.pitchLine.cgColor)
+                ctx.fillEllipse(in: rect)
+                ctx.setStrokeColor(NSColor.textBackgroundColor.cgColor)
+                ctx.setLineWidth(1.2)
+                ctx.strokeEllipse(in: rect)
+            }
+        }
+        // 선 위에 마우스: 누르면 생길 점
+        if let g = hoverInsert, case .none = drag {
+            let rect = CGRect(x: g.x - 5, y: g.y - 5, width: 10, height: 10)
+            ctx.setFillColor(NSColor.textBackgroundColor.withAlphaComponent(0.9).cgColor)
+            ctx.fillEllipse(in: rect)
+            ctx.setStrokeColor(NSColor.pitchLine.cgColor)
+            ctx.setLineWidth(1.3)
+            ctx.strokeEllipse(in: rect.insetBy(dx: 0.65, dy: 0.65))
+            ctx.move(to: CGPoint(x: g.x - 2.5, y: g.y))
+            ctx.addLine(to: CGPoint(x: g.x + 2.5, y: g.y))
+            ctx.move(to: CGPoint(x: g.x, y: g.y - 2.5))
+            ctx.addLine(to: CGPoint(x: g.x, y: g.y + 2.5))
+            ctx.strokePath()
+        }
+        for b in badges {
+            let r: CGFloat = hoverBadge == b.noteID ? 9 : 8
+            let rect = CGRect(x: b.center.x - r, y: b.center.y - r, width: 2 * r, height: 2 * r)
+            ctx.setFillColor((b.attached ? NSColor.pitchLine : NSColor.textBackgroundColor).cgColor)
+            ctx.fillEllipse(in: rect)
+            ctx.setStrokeColor(NSColor.pitchLine.cgColor)
+            ctx.setLineWidth(1.2)
+            ctx.strokeEllipse(in: rect.insetBy(dx: 0.6, dy: 0.6))
+            if let icon = symbol(b.attached ? "link" : "scissors", white: b.attached) {
+                let s = icon.size
+                let scale = min((2 * r - 7) / max(1, s.width), (2 * r - 7) / max(1, s.height))
+                let iw = s.width * scale, ih = s.height * scale
+                icon.draw(in: CGRect(x: b.center.x - iw / 2, y: b.center.y - ih / 2, width: iw, height: ih),
+                          from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    /// SF 기호를 한 색으로 (흰색 또는 음 높이 선 색)
+    private func symbol(_ name: String, white: Bool) -> NSImage? {
+        let key = name + (white ? "-w" : "-o")
+        if let img = symbolCache[key] { return img }
+        guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)) else { return nil }
+        let color: NSColor = white ? .white : .pitchLine
+        let img = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        symbolCache[key] = img
+        return img
+    }
+
+    /// 마우스 옆 작은 글
+    private func drawReadout(_ ctx: CGContext) {
+        guard let text = readout, let p = hover else { return }
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                                                    .foregroundColor: NSColor.white]
+        let s = (text as NSString).size(withAttributes: attrs)
+        var box = CGRect(x: p.x + 14, y: p.y + 16, width: s.width + 14, height: s.height + 6)
+        if box.maxX > bounds.width - 4 { box.origin.x = p.x - 14 - box.width }
+        if box.maxY > bounds.height - 4 { box.origin.y = p.y - 14 - box.height }
+        ctx.addPath(CGPath(roundedRect: box, cornerWidth: 6, cornerHeight: 6, transform: nil))
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        ctx.fillPath()
+        (text as NSString).draw(at: CGPoint(x: box.minX + 7, y: box.minY + 3), withAttributes: attrs)
+    }
+
+    private func dot(at p: NSPoint) -> Dot? {
+        var best: Dot?
+        var bestD: CGFloat = 49  // 7px 안
+        for d in dots {
+            let dd = (d.at.x - p.x) * (d.at.x - p.x) + (d.at.y - p.y) * (d.at.y - p.y)
+            if dd <= bestD {
+                best = d
+                bestD = dd
+            }
+        }
+        return best
+    }
+
+    private func badge(at p: NSPoint) -> Badge? {
+        badges.first { ($0.center.x - p.x) * ($0.center.x - p.x) + ($0.center.y - p.y) * ($0.center.y - p.y) <= 100 }
     }
 
     private func drawPhonemes(_ e: PartEditor, _ ctx: CGContext, t0: Double, t1: Double, top: CGFloat) {
@@ -550,6 +790,16 @@ final class PianoRollView: NSView {
         ("마디" as NSString).draw(at: CGPoint(x: 10, y: 9),
                                  withAttributes: [.font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
                                                   .foregroundColor: NSColor.tertiaryLabelColor])
+        // 반복해서 듣는 곳
+        if let r = model?.loopRange {
+            let a = max(keyW, x(Double(r.lowerBound - e.position))), b = min(w, x(Double(r.upperBound - e.position)))
+            if b > a {
+                let band = CGRect(x: a, y: rulerH - 7, width: b - a, height: 5)
+                ctx.addPath(CGPath(roundedRect: band, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil))
+                ctx.setFillColor(NSColor.easy.withAlphaComponent(0.7).cgColor)
+                ctx.fillPath()
+            }
+        }
         // 재생 시작점 깃발
         if startX >= keyW - 1 && startX <= w {
             let flag = CGMutablePath()
@@ -661,6 +911,7 @@ final class PianoRollView: NSView {
 
     func toolChanged() {
         endLyric()
+        clearHover()
         window?.invalidateCursorRects(for: self)
         if let p = hover { updateCursor(p) }
         needsDisplay = true
@@ -670,8 +921,10 @@ final class PianoRollView: NSView {
 
     /// 끌던 것을 그만둔다 (Esc)
     func cancelDrag() {
+        if case let .move(_, _, _, _, copy?) = drag { editor?.dropDuplicates(copy.ids, restoring: copy.before) }
         drag = .none
         changed = false
+        readout = nil
         needsDisplay = true
     }
 
@@ -687,20 +940,59 @@ final class PianoRollView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         hover = p
+        updateHover(p)
         updateCursor(p)
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         hover = nil
+        clearHover()
         needsDisplay = true
+    }
+
+    private func clearHover() {
+        hoverDot = nil
+        hoverBadge = nil
+        hoverInsert = nil
+        readout = nil
+    }
+
+    /// 마우스 아래의 점 · 이음 표시 · 선 (그리고 옆에 보일 글)
+    private func updateHover(_ p: NSPoint) {
+        clearHover()
+        guard let e = editor, p.x >= keyW, p.y >= rulerH, p.y < gridBottom, lyricNote == nil else { return }
+        if let b = badge(at: p) {
+            hoverBadge = b.noteID
+            readout = b.attached ? "앞 섹터와 이어 불러요 · 누르면 끊어요" : "앞 섹터와 끊겨 있어요 · 누르면 이어요"
+            return
+        }
+        guard e.tool == .pitch else { return }
+        if let d = dot(at: p) {
+            hoverDot = (d.noteID, d.index)
+            readout = PartEditor.pitchText(d.cents) + (d.locked ? " · 옆으로만 (높이는 이웃 섹터를 따라가요)" : "")
+            return
+        }
+        if let ly = lineY(atX: p.x), abs(ly - p.y) <= 6, e.canInsertPoint(atTick: tick(p.x)) {
+            hoverInsert = CGPoint(x: p.x, y: ly)
+            readout = "끌면 여기서 접혀요"
+        }
+    }
+
+    /// 끄는 점의 글: "솔 G4 +12센트 · 섹터 시작에서 40ms"
+    private func pointText(_ g: PartEditor.PointGrab, shown: Double) -> String {
+        guard let pt = editor?.draftPoint(g) else { return PartEditor.pitchText(shown) }
+        let c = shown + (pt.y - g.y) * 10
+        let when = abs(pt.x) < 0.5 ? "섹터 시작" : pt.x < 0 ? "섹터 앞 \(Int(-pt.x.rounded()))ms" : "\(Int(pt.x.rounded()))ms"
+        return PartEditor.pitchText(c) + " · " + when
     }
 
     override func cursorUpdate(with event: NSEvent) { updateCursor(convert(event.locationInWindow, from: nil)) }
 
     private func updateCursor(_ p: NSPoint) {
         guard let e = editor else { return }
-        if p.y < rulerH || p.x < keyW || p.y >= gridBottom { NSCursor.pointingHand.set(); return }
+        if p.y < rulerH || p.x < keyW || p.y >= gridBottom || hoverBadge != nil { NSCursor.pointingHand.set(); return }
+        if case .point = drag { NSCursor.closedHand.set(); return }
         switch e.tool {
         case .note:
             if let (_, edge) = hit(p) {
@@ -708,7 +1000,9 @@ final class PianoRollView: NSView {
             } else {
                 NSCursor.crosshair.set()
             }
-        case .pitch, .erase:
+        case .pitch:
+            (hoverDot != nil || hoverInsert != nil ? NSCursor.openHand : NSCursor.crosshair).set()
+        case .erase:
             NSCursor.crosshair.set()
         }
     }
@@ -745,15 +1039,50 @@ final class PianoRollView: NSView {
             }
             return
         }
-        let hitNote = hit(p)
-        // ⌥ 끌기 (음 높이 도구, 또는 섹터 도구의 빈 곳): 곡선을 잡아 밀기
-        if flags.contains(.option), e.tool == .pitch || (e.tool == .note && hitNote == nil) {
-            e.beginPitchBend(tick: tick(p.x), radius: Int(70 / e.pxPerTick))
-            drag = .bend(start: p)
+        // 섹터 사이 이음 표시: 앞 섹터와 잇기 · 끊기
+        if let b = badge(at: p) {
+            readout = e.toggleAttached(noteID: b.noteID) ? "앞 섹터와 이었어요" : "앞 섹터와 끊었어요"
+            drag = .none
+            needsDisplay = true
             return
         }
+        let hitNote = hit(p)
         switch e.tool {
         case .pitch:
+            if let d = dot(at: p) {
+                if flags.contains(.option) {
+                    // ⌥ 클릭: 그 점에서 다음 점까지 모양 바꾸기
+                    if let shape = e.cyclePointShape(noteID: d.noteID, index: d.index) {
+                        readout = "점 사이 모양: \(PitchPoints.shapeName(shape))"
+                    } else {
+                        readout = "끝 점 뒤에는 모양이 없어요"
+                    }
+                    drag = .none
+                    needsDisplay = true
+                    return
+                }
+                if event.clickCount >= 2 {
+                    readout = e.deletePoint(noteID: d.noteID, index: d.index) ? "점을 지웠어요" : "첫 점 · 끝 점은 지울 수 없어요"
+                    drag = .none
+                    needsDisplay = true
+                    return
+                }
+                if let g = e.grabPoint(noteID: d.noteID, index: d.index) {
+                    drag = .point(grab: g, start: p, at: (tick(p.x), toneValue(p.y)), shown: d.cents, moved: false)
+                    readout = pointText(g, shown: d.cents)
+                    updateCursor(p)
+                    return
+                }
+            }
+            // 선을 잡으면 거기에 점이 생기고, 끌면 그 자리에서 접힌다 (⌥면 그냥 그리기)
+            if !flags.contains(.option), let ly = lineY(atX: p.x), abs(ly - p.y) <= 6, let c = lineCents(at: tick(p.x)),
+               let g = e.insertPoint(atTick: tick(p.x)) {
+                drag = .point(grab: g, start: p, at: (tick(p.x), toneValue(p.y)), shown: c, moved: false)
+                hoverInsert = nil
+                readout = pointText(g, shown: c)
+                updateCursor(p)
+                return
+            }
             e.beginPitchStroke(tick: tick(p.x), tone: toneValue(p.y))
             drag = .pitch(start: p, moved: false)
             return
@@ -769,6 +1098,13 @@ final class PianoRollView: NSView {
                 drag = .none
                 return
             }
+            // ⌥ 끌기: 복제해서 옮기기 (고른 섹터 모두, 누른 섹터가 안 골라져 있으면 그것만)
+            if flags.contains(.option), !edge, let dup = e.duplicateForDrag(anchor: n.id) {
+                drag = .move(anchor: dup.anchor, origin: dup.origin, start: p, lastTone: n.n.tone,
+                             copy: (Set(dup.origin.keys), dup.before))
+                e.preview.play(n.n.tone)
+                return
+            }
             if flags.contains(.shift) || flags.contains(.command) {
                 if e.selection.contains(n.id) {
                     e.selection.remove(n.id)
@@ -781,7 +1117,7 @@ final class PianoRollView: NSView {
             }
             let origin = Dictionary(uniqueKeysWithValues: e.selected.map { ($0.id, $0.n) })
             drag = edge ? .resize(anchor: n.id, origin: origin, start: p)
-                        : .move(anchor: n.id, origin: origin, start: p, lastTone: n.n.tone)
+                        : .move(anchor: n.id, origin: origin, start: p, lastTone: n.n.tone, copy: nil)
             e.preview.play(n.n.tone)
             return
         }
@@ -807,23 +1143,36 @@ final class PianoRollView: NSView {
             guard abs(p.x - start.x) > 3 || abs(p.y - start.y) > 3 else { return }
             // 빈 곳에서 끌기: 음 높이 곡선 그리기
             e.beginPitchStroke(tick: tick(start.x), tone: toneValue(start.y))
-            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y))
+            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y), straight: event.modifierFlags.contains(.shift))
             drag = .pitch(start: start, moved: true)
             changed = true
+            readout = PartEditor.pitchText(toneValue(p.y) * 100)
         case let .pitch(start, moved):
             guard moved || abs(p.x - start.x) > 2 || abs(p.y - start.y) > 2 else { return }
-            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y))
+            // ⇧: 누른 곳에서 여기까지 곧게
+            e.continuePitchStroke(tick: tick(p.x), tone: toneValue(p.y), straight: event.modifierFlags.contains(.shift))
             drag = .pitch(start: start, moved: true)
             changed = true
-        case let .bend(start):
-            e.continuePitchBend(cents: Double((start.y - p.y) / e.rowHeight) * 100)
-            changed = true
+            readout = PartEditor.pitchText(toneValue(p.y) * 100)
+        case let .point(g, start, at, shown, moved):
+            guard moved || abs(p.x - start.x) > 2 || abs(p.y - start.y) > 2 else { return }
+            let flags = event.modifierFlags
+            // 옆: 끈 시간만큼 (⇧면 그대로), 위아래: 끈 만큼 (0.1 반음). ⌘면 보이는 선이 반음에 딱 맞게.
+            let dx = flags.contains(.shift) ? 0
+                : e.axis.ms(Double(e.position) + tick(p.x)) - e.axis.ms(Double(e.position) + at.tick)
+            var dy = (toneValue(p.y) - at.tone) * 10
+            if flags.contains(.command) {
+                dy = ((shown + dy * 10) / 100).rounded() * 10 - shown / 10
+            }
+            e.movePoint(g, x: g.x + dx, y: g.y + dy)
+            drag = .point(grab: g, start: start, at: at, shown: shown, moved: true)
+            readout = pointText(g, shown: shown)
         case let .erase(lastTick, downNote, _):
             let t = tick(p.x)
             e.erasePitch(from: min(lastTick, t), to: max(lastTick, t))
             drag = .erase(lastTick: t, downNote: downNote, moved: true)
             changed = true
-        case let .move(anchor, origin, start, lastTone):
+        case let .move(anchor, origin, start, lastTone, copy):
             guard let a = origin[anchor] else { return }
             var dt = snap(Double(a.position) + tick(p.x) - tick(start.x)) - a.position
             dt = max(dt, -(origin.values.map(\.position).min() ?? 0))
@@ -841,7 +1190,7 @@ final class PianoRollView: NSView {
             }
             if a.tone + dp != lastTone {
                 e.preview.play(a.tone + dp)
-                drag = .move(anchor: anchor, origin: origin, start: start, lastTone: a.tone + dp)
+                drag = .move(anchor: anchor, origin: origin, start: start, lastTone: a.tone + dp, copy: copy)
             }
         case let .resize(anchor, origin, start):
             guard let a = origin[anchor] else { return }
@@ -886,8 +1235,16 @@ final class PianoRollView: NSView {
             beginLyric(id)
         case .pitch:
             if changed { e.finishPitchEdit("command.pitch.draw") } else { e.cancelPitchEdit() }
-        case .bend:
-            if changed { e.finishPitchEdit("command.pitch.bend") } else { e.cancelPitchEdit() }
+            readout = nil
+        case let .point(g, _, _, _, moved):
+            if g.inserted && !moved {
+                // 선을 누르기만 했으면 점을 넣지 않는다 (곡선 모양이 그대로)
+                e.pointDraft = nil
+            } else {
+                // 이웃 점 바로 위(8px 안)에 놓으면 그 점을 지운다 (OpenUtau와 같다)
+                e.endPointDrag(g, remove: moved && nearNeighbor(g))
+            }
+            readout = nil
         case let .erase(_, downNote, moved):
             if moved {
                 if changed { e.finishPitchEdit("command.pitch.erase") }
@@ -895,8 +1252,12 @@ final class PianoRollView: NSView {
                 e.selection = [id]
                 e.deleteSelection()
             }
-        case .move:
-            if changed { e.commit("command.note.move") }
+        case let .move(_, _, _, _, copy):
+            if changed {
+                e.commit(copy == nil ? "command.note.move" : "command.note.duplicate")
+            } else if let copy {
+                e.dropDuplicates(copy.ids, restoring: copy.before)
+            }
         case let .resize(anchor, _, _):
             if changed {
                 if let n = e.notes.first(where: { $0.id == anchor }) { e.rememberLength(n.n.duration) }
@@ -908,8 +1269,25 @@ final class PianoRollView: NSView {
         drag = .none
         changed = false
         heldKey = nil
+        updateHover(p)
         updateCursor(p)
         needsDisplay = true
+    }
+
+    /// 끄는 점이 이웃 점과 8px 안인지 (첫 점 · 끝 점은 지우지 않는다)
+    private func nearNeighbor(_ g: PartEditor.PointGrab) -> Bool {
+        guard let e = editor, let d = e.pointDraft, d.noteID == g.noteID, let n = e.notes.first(where: { $0.id == g.noteID })?.n,
+              g.index > 0, g.index < d.pitch.data.count - 1 else { return false }
+        let pts = d.pitch.data
+        func at(_ i: Int) -> CGPoint {
+            CGPoint(x: x(PitchPoints.tick(pts[i].x, of: n, axis: e.axis, partPosition: e.position)),
+                    y: CGFloat(-pts[i].y / 10) * e.rowHeight)
+        }
+        let me = at(g.index)
+        return [g.index - 1, g.index + 1].contains { i in
+            let o = at(i)
+            return (o.x - me.x) * (o.x - me.x) + (o.y - me.y) * (o.y - me.y) < 64
+        }
     }
 
     /// 우클릭: 재생 시작점 (섹터 위면 그 섹터 시작). 스페이스를 누르면 여기서부터 들린다.

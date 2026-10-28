@@ -82,8 +82,12 @@ final class PartEditor: ObservableObject {
     private var nextLabel: String?
     /// 다른 프로젝트를 열어서 버린 편집 화면: 더는 엔진에 보내지 않는다
     private var closed = false
+    /// 미끄럼을 끄는 동안 바꾼 것이 있는지 (놓을 때 보낸다)
+    private var sliderDirty = false
     private var lastLength = 480
     private var clipboard: [NoteData] = []
+    /// ⌘C로 복사한 첫 섹터의 설정 (설정만 붙여 넣기)
+    private(set) var copiedSettings: NoteSettings?
     /// 다 읽은 뒤 보여 줄 곳 (파트 틱)
     private var pendingReveal: Int?
     /// 다 읽은 뒤 되살릴 화면 (다른 앱에서 고친 파일을 다시 읽을 때)
@@ -95,7 +99,10 @@ final class PartEditor: ObservableObject {
     /// 그리는 중인 음 높이 곡선 (떼기 전까지는 악보에만 그리고 발행하지 않는다: 끌 때 화면 전체가 다시 계산되면 끊긴다)
     private(set) var pitchDraft: CurveData? { didSet { redraw() } }
     private var sketch: PitchSketch?
-    private var bend: PitchBend?
+    /// 펜으로 긋기 시작한 곳 (⇧ 직선)
+    private var strokeStart: (tick: Double, cents: Double)?
+    /// 끄는 중인 음 높이 점: 그 섹터의 새 점 (떼기 전까지는 악보에만 그린다)
+    var pointDraft: (noteID: Int, pitch: PitchData)? { didSet { redraw() } }
 
     init(model: AppModel, partIndex: Int) {
         self.model = model
@@ -215,6 +222,16 @@ final class PartEditor: ObservableObject {
         Task { await send(label) }
     }
 
+    /// 바꾼 것을 넣은 뒤: commitNow면 (이번이나 미끄럼을 끄는 동안 바뀐 게 있을 때) 보내고, 아니면 놓을 때까지 기다린다.
+    func finish(_ changed: Bool, _ label: String, commitNow: Bool) {
+        if commitNow {
+            if changed || sliderDirty { commit(label) }
+            sliderDirty = false
+        } else if changed {
+            sliderDirty = true
+        }
+    }
+
     /// 고친 것을 기억만 하고 아직 보내지 않는다. 다음 commit · commitStaged · flush 때 함께 간다 (되돌리기 한 칸).
     func stage(_ label: String) {
         version += 1
@@ -224,7 +241,9 @@ final class PartEditor: ObservableObject {
     }
 
     /// 아직 엔진에 안 보낸 것이 있나 (입력 중인 가사 · 그리는 중인 곡선 포함)
-    var hasPendingEdits: Bool { sentVersion < version || syncing || pitchDraft != nil || canvas?.lyricNote != nil }
+    var hasPendingEdits: Bool {
+        sentVersion < version || syncing || pitchDraft != nil || pointDraft != nil || canvas?.lyricNote != nil
+    }
 
     /// 기억만 해 둔 것을 보낸다 (새 섹터의 가사 입력이 끝났을 때).
     func commitStaged() {
@@ -273,6 +292,7 @@ final class PartEditor: ObservableObject {
     func flush() async {
         canvas?.endLyric()
         finishPitchEdit()
+        commitPointDraft()
         if !syncing && sentVersion < version { await send("command.note.edit") }
         while syncing { try? await Task.sleep(nanoseconds: 20_000_000) }
     }
@@ -375,7 +395,14 @@ final class PartEditor: ObservableObject {
         commit("command.note.merge")
     }
 
-    func copySelection() { clipboard = selected.map(\.n).sorted { $0.position < $1.position } }
+    func copySelection() {
+        clipboard = selected.map(\.n).sorted { $0.position < $1.position }
+        let o = orderedNotes
+        if let k = o.firstIndex(where: { selection.contains($0.id) }) {
+            copiedSettings = NoteSettings(vibrato: o[k].n.vibrato, exps: o[k].n.exps,
+                                          pitch: PitchPoints.effective(o.map(\.n), k, defaults: defaults))
+        }
+    }
 
     func cutSelection() {
         copySelection()
@@ -393,6 +420,30 @@ final class PartEditor: ObservableObject {
         notes += made
         selection = Set(made.map(\.id))
         commit("command.note.paste")
+    }
+
+    /// ⌥ 끌어 복제: 고른 섹터(누른 섹터가 안 골라져 있으면 그것만)를 그 자리에 복제하고 복제한 것을 고른다.
+    /// (끌 섹터 id, 복제한 섹터들의 처음 내용, 원래 선택)
+    func duplicateForDrag(anchor: Int) -> (anchor: Int, origin: [Int: NoteData], before: Set<Int>)? {
+        let before = selection
+        let source = selection.contains(anchor) ? selected : notes.filter { $0.id == anchor }
+        guard !source.isEmpty else { return nil }
+        var newAnchor = anchor
+        var made: [EditNote] = []
+        for s in source {
+            let copy = EditNote(id: makeID(), n: s.n)
+            if s.id == anchor { newAnchor = copy.id }
+            made.append(copy)
+        }
+        notes += made
+        selection = Set(made.map(\.id))
+        return (newAnchor, Dictionary(uniqueKeysWithValues: made.map { ($0.id, $0.n) }), before)
+    }
+
+    /// 복제하고 안 끌었을 때: 복제한 것을 없앤다 (보낸 적이 없어서 되돌리기도 없다)
+    func dropDuplicates(_ ids: Set<Int>, restoring before: Set<Int>) {
+        notes.removeAll { ids.contains($0.id) }
+        selection = before
     }
 
     func duplicateSelection() {
@@ -485,24 +536,18 @@ final class PartEditor: ObservableObject {
         sketch = PitchSketch(notes: sortedDatas, axis: axis, partPosition: position, duration: duration,
                              defaults: defaults, original: pitd)
         sketch?.add(tick: tick, cents: tone * 100)
+        strokeStart = (tick, tone * 100)
     }
 
-    /// 펜이 움직임: 화면의 선이 펜이 지나간 곳 그대로 되게
-    func continuePitchStroke(tick: Double, tone: Double) {
+    /// 펜이 움직임: 화면의 선이 펜이 지나간 곳 그대로 되게. straight(⇧)면 누른 곳에서 여기까지 곧게.
+    func continuePitchStroke(tick: Double, tone: Double, straight: Bool = false) {
         guard sketch != nil else { return }
-        sketch?.add(tick: tick, cents: tone * 100)
+        if straight, let a = strokeStart {
+            sketch?.line(from: a, to: (tick, tone * 100))
+        } else {
+            sketch?.add(tick: tick, cents: tone * 100)
+        }
         pitchDraft = sketch?.result()
-    }
-
-    /// ⌥ 끌기: 그 자리의 곡선을 잡아 위아래로 민다 (둘레는 부드럽게 따라온다). radius: 틱
-    func beginPitchBend(tick: Double, radius: Int) {
-        finishPitchEdit()
-        bend = PitchBend(original: pitd, center: CurveMath.snap(tick), radius: max(30, radius))
-    }
-
-    func continuePitchBend(cents: Double) {
-        guard let bend else { return }
-        pitchDraft = bend.result(delta: cents)
     }
 
     /// 지우개로 [a, b]를 지나감: 그린 곡선이 없어지고 (음표가 만드는 높이로) 양 끝은 부드럽게
@@ -517,7 +562,7 @@ final class PartEditor: ObservableObject {
     func finishPitchEdit(_ label: String = "command.pitch.draw") {
         let draft = pitchDraft
         sketch = nil
-        bend = nil
+        strokeStart = nil
         pitchDraft = nil
         guard let draft, draft != pitd else { return }
         curves["pitd"] = draft.xs.isEmpty ? nil : draft
@@ -527,8 +572,9 @@ final class PartEditor: ObservableObject {
     /// 그리던 것을 버린다 (Esc · 되돌리기)
     func cancelPitchEdit() {
         sketch = nil
-        bend = nil
+        strokeStart = nil
         pitchDraft = nil
+        pointDraft = nil
     }
 
     /// 선택한 섹터(없으면 전체)의 음 높이를 부드럽게: 손으로 그리거나 AutoTuner가 따온 곡선의 잔떨림을 고른다.
@@ -557,20 +603,41 @@ final class PartEditor: ObservableObject {
         commit("command.pitch.reset")
     }
 
-    /// 앞 섹터에서 넘어오는 모양 (포르타멘토): 길이 ms, 시작 ms (음수 = 음표 앞에서), 모양
-    func setPortamento(length: Double, start: Double, shape: PitchShape) {
-        updateSelected("command.pitch.portamento") { n in
-            n.pitch = PitchData(snapFirst: true, data: [
-                PitchPointData(x: start, y: 0, shape: shape),
-                PitchPointData(x: start + length, y: 0, shape: shape),
-            ])
+    /// 앞 섹터에서 넘어오는 모양 (포르타멘토): 시작 ms (음수 = 섹터 앞에서), 걸리는 ms, 모양. nil은 그대로.
+    /// 앞 섹터와 이어 부르는 고른 섹터에만. 넘어간 뒤의 점(음 높이 점)은 그대로 둔다.
+    func setPortamento(start: Double? = nil, length: Double? = nil, shape: PitchShape? = nil, commitNow: Bool = true) {
+        let o = orderedNotes
+        var datas = o.map(\.n)
+        for k in o.indices where selection.contains(o[k].id) {
+            guard PitchPoints.isAttached(datas, k, axis: axis, partPosition: position, defaults: defaults) else { continue }
+            datas[k].pitch = PitchPoints.withPortamento(datas, k, start: start, length: length, shape: shape,
+                                                        axis: axis, partPosition: position, defaults: defaults)
         }
+        finish(apply(datas, ids: o.map(\.id)), "command.pitch.portamento", commitNow: commitNow)
     }
 
-    func portamento(of n: NoteData) -> (length: Double, start: Double, shape: PitchShape) {
-        let pts = n.pitch?.data ?? PitchMath.defaultPoints(defaults)
-        guard pts.count >= 2 else { return (Double(defaults.portamentoLength), Double(defaults.portamentoStart), .io) }
-        return (pts[1].x - pts[0].x, pts[0].x, pts[0].shape)
+    /// 넘어가기 (시작 ms, 걸리는 ms, 모양)
+    func portamento(of id: Int) -> (start: Double, length: Double, shape: PitchShape)? {
+        let o = orderedNotes
+        guard let k = o.firstIndex(where: { $0.id == id }) else { return nil }
+        return PitchPoints.portamento(PitchPoints.effective(o.map(\.n), k, defaults: defaults).data, defaults: defaults)
+    }
+
+    /// 시작 순서로 바꾼 내용(datas, ids와 같은 순서)을 섹터에 넣는다. 바뀐 게 있으면 true (한 번만 발행).
+    @discardableResult
+    func apply(_ datas: [NoteData], ids: [Int]) -> Bool {
+        var byID: [Int: NoteData] = [:]
+        for (i, id) in ids.enumerated() where datas.indices.contains(i) { byID[id] = datas[i] }
+        var items = notes
+        var changed = false
+        for i in items.indices {
+            if let n = byID[items[i].id], n != items[i].n {
+                items[i].n = n
+                changed = true
+            }
+        }
+        if changed { notes = items }
+        return changed
     }
 
     // MARK: 표현 곡선 (세기 · 숨 등): 선택한 섹터 구간에 더하기
@@ -689,6 +756,7 @@ final class PartEditor: ObservableObject {
             case kVK_ANSI_A: selectAll()
             case kVK_ANSI_C: copySelection()
             case kVK_ANSI_X: cutSelection()
+            case kVK_ANSI_V where flags.contains(.option): pasteSettings()
             case kVK_ANSI_V: paste(at: (model?.startTick ?? position) - position)
             case kVK_ANSI_D: duplicateSelection()
             case kVK_ANSI_Equal: zoom(1.3)
@@ -712,7 +780,7 @@ final class PartEditor: ObservableObject {
             guard !selection.isEmpty else { return false }
             canvas?.beginLyric()
         case kVK_Escape:
-            if pitchDraft != nil {
+            if pitchDraft != nil || pointDraft != nil {
                 cancelPitchEdit()
                 canvas?.cancelDrag()
                 return true
