@@ -8,3 +8,5 @@ OpenUtau.app/
 host/
 *.zip
 *.dmg
+__pycache__/
+*.pyc

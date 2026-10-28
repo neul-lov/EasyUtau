@@ -1,0 +1,106 @@
+name: Mac 앱 빌드 · 엔진 시험
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 같은 브랜치에 새로 올리면 앞의 실행은 멈춰요
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 이 저장소에 쓰지 않아요 (OpenUtau 릴리스 받기 · 아티팩트 올리기만)
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  app:
+    name: EasyUtau.app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: OpenUtau (Mac) 받기
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: devtools/get_openutau.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: swift --version
+      - name: 앱 빌드 (엔진 + 화면)
+        env:
+          EASYUTAU_OPENUTAU: ${{ github.workspace }}/OpenUtau.app
+        run: cd mac && ./build.sh
+      - name: Apple Silicon · 인텔 Mac 둘 다 되는지
+        run: |
+          archs=$(lipo -archs mac/build/EasyUtau.app/Contents/MacOS/EasyUtau)
+          echo "$archs"; [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
+          ls -l mac/build/EasyUtau.app/Contents/Resources/engine/EasyUtauEngine.dll
+          plutil -lint mac/build/EasyUtau.app/Contents/Info.plist
+          # easyutau:// 주소로 AutoTuner에서 넘어올 수 있어야 해요
+          plutil -extract CFBundleURLTypes.0.CFBundleURLSchemes.0 raw mac/build/EasyUtau.app/Contents/Info.plist
+      - name: 압축
+        run: ditto -c -k --keepParent mac/build/EasyUtau.app EasyUtau-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EasyUtau-mac
+          path: EasyUtau-mac.zip
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EasyUtauEngine
+          path: mac/build/engine/EasyUtauEngine.dll
+          retention-days: 7
+
+  engine:
+    name: 엔진 시험 (실제 음원으로, 소리 재생 없음)
+    # 다른 사람 저장소(포크)에서 온 PR에서는 테토 음원을 받지 않아요
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: app
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: pyyaml (AutoTuner가 쓰는 방식으로 저장 파일을 읽어 보려고)
+        run: python -m pip install pyyaml
+      - uses: actions/download-artifact@v4
+        with:
+          name: EasyUtauEngine
+      - name: OpenUtau (Mac) 받기
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: devtools/get_openutau.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: 테토 음원 받기 (공식 배포 · OpenUTAU용 통합 세트, 시험에만 쓰고 올리지 않아요)
+        run: |
+          curl -fL --retry 3 -o teto.zip https://kasaneteto.jp/assets/download/utau/TETO-OUset240323.zip
+          python devtools/install_voicebank.py teto.zip
+      - name: 엔진 돌릴 폴더 준비 (앱이 하는 것과 같은 방식)
+        run: python devtools/engine_host.py "$PWD/OpenUtau.app" "$PWD/EasyUtauEngine.dll" "$PWD/host"
+      - name: 일본어 가사로
+        run: python devtools/engine_test.py "$PWD/host" out/ja | tee out-ja.txt
+      - name: 한국어 가사로
+        run: python devtools/engine_test.py "$PWD/host" out/ko "안,녕,하,세,요,노,을,아" | tee out-ko.txt
+      - name: 결과 요약
+        if: always()
+        run: |
+          { echo "### 엔진 시험"; echo '```'; grep -h "^RESULT\|발음 \|내보낸 소리" out-*.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: 결과 숫자만 올리기 (소리 파일은 올리지 않아요)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-test
+          path: |
+            out-*.txt
+            out
+            !out/**/*.wav
+          retention-days: 14
