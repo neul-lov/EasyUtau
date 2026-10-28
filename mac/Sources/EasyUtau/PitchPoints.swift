@@ -304,14 +304,17 @@ enum PitchPoints {
                                      vibrato: false, defaults: defaults)
         func x(_ i: Int) -> Int { lo + i * step }
         func index(_ t: Int) -> Int { max(0, min(count - 1, (t - lo) / step)) }
-        // 고칠 창: 경계 앞뒤 100ms (섹터 길이의 45%까지), 점이 바뀌어서 높이가 달라진 곳은 모두
+        // 고칠 창: 경계 앞뒤 100ms (섹터 길이의 45%까지), 점이 바뀌어서 높이가 달라진 곳은 모두.
+        // 창 양 끝에서 원래 곡선으로 돌아가는 곳은 넘어가던 곳이 다 끝난 뒤에 (안 그러면 넘어가던 모양이 조금 남는다)
         let leftLen = min(ticks(cutWindowMs, near: at, axis: axis, partPosition: partPosition), Int(Double(p.duration) * 0.45))
         let rightLen = min(ticks(cutWindowMs, near: n.position, axis: axis, partPosition: partPosition), Int(Double(n.duration) * 0.45))
+        let rampTicksL = ticks(cutRampMs, near: at, axis: axis, partPosition: partPosition)
+        let rampTicksR = ticks(cutRampMs, near: n.position, axis: axis, partPosition: partPosition)
         var left = at - max(step, leftLen)
         var right = n.position + max(step, rightLen)
         for i in 0..<count where abs(baseOld[i] - baseNew[i]) > 0.5 {
-            left = min(left, x(i) - step)
-            right = max(right, x(i) + step)
+            left = min(left, x(i) - step - rampTicksL)
+            right = max(right, x(i) + step + rampTicksR)
         }
         left = max(lo + step, CurveMath.snap(Double(left)))
         right = min(hi - step, CurveMath.snap(Double(right)))
