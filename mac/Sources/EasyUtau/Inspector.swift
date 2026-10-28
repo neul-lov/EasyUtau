@@ -60,8 +60,9 @@ struct Inspector: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         lyricSection
+                        pitchSection
+                        refineSection
                         vibratoSection
-                        portamentoSection
                         pronunciationSection
                         soundSection
                         curveSection
@@ -141,6 +142,7 @@ struct Inspector: View {
                     Text("길이 \(String(format: "%.2f", Double(one.duration) / 480))박 · \(Int(editor.axis.ms(Double(editor.position + one.duration)) - editor.axis.ms(Double(editor.position))))ms")
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.tertiary)
+                    pasteSettingsButton
                 }
             } else {
                 InspectorSection(title: "고른 섹터 \(selected.count)개", icon: "textformat") {
@@ -149,9 +151,17 @@ struct Inspector: View {
                         SmallButton("하나로 합치기", icon: "arrow.triangle.merge") { editor.mergeSelection() }
                             .disabled(selected.count < 2)
                     }
+                    pasteSettingsButton
                 }
             }
         }
+    }
+
+    private var pasteSettingsButton: some View {
+        SmallButton("설정만 붙여 넣기", icon: "doc.on.clipboard") { editor.pasteSettings() }
+            .disabled(!editor.canPasteSettings)
+            .opacity(editor.canPasteSettings ? 1 : 0.45)
+            .help("⌘C로 복사한 섹터의 떨림 · 소리 설정 · 음 높이 모양만 고른 섹터에 넣어요. 가사 · 음 · 길이는 그대로예요 (⌥⌘V)")
     }
 
     // MARK: 떨림
@@ -197,42 +207,107 @@ struct Inspector: View {
         return v.length == preset.vibrato.length && v.period == preset.vibrato.period && v.depth == preset.vibrato.depth
     }
 
-    // MARK: 앞 음에서 넘어오는 모양
+    // MARK: 음 높이 (잇기 · 넘어가기 · 모양)
 
-    private var portamentoSection: some View {
-        InspectorSection(title: "음 넘어가기", icon: "arrow.turn.right.up",
-                         help: "앞 섹터에서 이 섹터로 음이 옮겨 가는 모양이에요. 악보의 주황색 선으로 보여요") {
+    private var pitchSection: some View {
+        let info = editor.attachInfo(editor.selection)
+        let allAttached = info.count > 0 && info.attached == info.count
+        return InspectorSection(title: "음 높이", icon: "point.topleft.down.curvedto.point.bottomright.up",
+                                help: "음 높이 도구(2)에서 주황색 선을 잡아 끌면 그 자리에서 접혀요. 여기서는 고른 섹터를 한꺼번에 바꿔요") {
+            if info.count > 0 {
+                Toggle(isOn: Binding(get: { allAttached }, set: { editor.setAttached($0, noteIDs: editor.selection) })) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("앞 섹터와 이어 부르기").font(.system(size: 11.5, weight: .semibold))
+                        Text(attachDetail(info)).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("끄면 앞 섹터에서 미끄러져 오지 않고 제 음에서 바로 시작해요 (OpenUtau의 '이전 노트에 물리기'). 악보의 이음 표시를 눌러도 돼요")
+            }
+            if info.attached > 0 {
+                portamentoControls
+            }
+            subTitle("모양 넣기")
             FlowLayout(spacing: 6) {
-                ForEach(Self.portamentoPresets, id: \.title) { preset in
-                    ChipButton(title: preset.title, detail: preset.detail, on: isPortamento(preset)) {
-                        editor.setPortamento(length: preset.length, start: preset.start, shape: preset.shape)
+                ForEach(PitchPoints.Preset.allCases) { preset in
+                    let ok = editor.canApply(preset)
+                    ChipButton(title: preset.title, detail: preset.detail, on: false) { editor.applyPreset(preset) }
+                        .disabled(!ok)
+                        .opacity(ok ? 1 : 0.45)
+                        .help(presetHelp(preset))
+                }
+            }
+            subTitle("점 사이 모양")
+            FlowLayout(spacing: 6) {
+                ForEach(PitchPoints.shapeCycle, id: \.self) { shape in
+                    ChipButton(title: PitchPoints.shapeName(shape), detail: PitchPoints.shapeDetail(shape),
+                               on: editor.selectedPointShape == shape) {
+                        editor.setPointShape(shape)
                     }
                 }
             }
-            if let n = selected.first?.n {
-                let p = editor.portamento(of: n)
-                LabeledSlider(title: "걸리는 시간", value: p.length, range: 5...400, unit: "ms",
-                              help: "길면 천천히 미끄러져요") { value, done in
-                    editor.updateSelected("command.pitch.portamento", commitNow: done) {
-                        let cur = editor.portamento(of: $0)
-                        $0.pitch = PitchData(snapFirst: true, data: [
-                            PitchPointData(x: cur.start, y: 0, shape: cur.shape),
-                            PitchPointData(x: cur.start + value, y: 0, shape: cur.shape),
-                        ])
-                    }
-                }
-                LabeledSlider(title: "시작하는 곳", value: p.start, range: -300...100, unit: "ms",
-                              help: "음수면 섹터가 시작되기 전부터 움직여요") { value, done in
-                    editor.updateSelected("command.pitch.portamento", commitNow: done) {
-                        let cur = editor.portamento(of: $0)
-                        $0.pitch = PitchData(snapFirst: true, data: [
-                            PitchPointData(x: value, y: 0, shape: cur.shape),
-                            PitchPointData(x: value + cur.length, y: 0, shape: cur.shape),
-                        ])
-                    }
+            SmallButton("음 높이 점 처음대로", icon: "arrow.counterclockwise") { editor.resetPoints() }
+                .help("고른 섹터의 음 높이 점을 처음(기본 넘어가기)으로 되돌려요. 앞 섹터와 잇거나 끊은 것은 그대로예요")
+        }
+    }
+
+    private func subTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10.5, weight: .bold))
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+    }
+
+    private func attachDetail(_ info: (count: Int, attached: Int)) -> String {
+        if info.attached == 0 { return "끊겨 있어요: 제 음에서 바로 시작해요" }
+        if info.attached == info.count { return "앞 섹터 음에서 미끄러져 와요" }
+        return "\(info.count)개 중 \(info.attached)개만 이어져 있어요"
+    }
+
+    private func presetHelp(_ preset: PitchPoints.Preset) -> String {
+        switch preset {
+        case .scoop: "음을 조금 아래에서 시작해 올려 불러요"
+        case .overshoot: "목표 음을 살짝 넘쳤다가 돌아와요 (힘 있게)"
+        case .fall: "끝에서 음을 툭 떨어뜨려요. 뒤 섹터와 이어져 있으면 못 해요"
+        }
+    }
+
+    /// 앞 섹터에서 넘어오는 모양 (이어 부르는 섹터만)
+    @ViewBuilder
+    private var portamentoControls: some View {
+        subTitle("앞 섹터에서 넘어오기")
+        FlowLayout(spacing: 6) {
+            ForEach(Self.portamentoPresets, id: \.title) { preset in
+                ChipButton(title: preset.title, detail: preset.detail, on: isPortamento(preset)) {
+                    editor.setPortamento(start: preset.start, length: preset.length, shape: preset.shape)
                 }
             }
-            HStack(spacing: 6) {
+        }
+        if let id = editor.firstAttachedSelected, let p = editor.portamento(of: id) {
+            LabeledSlider(title: "걸리는 시간", value: p.length, range: 5...400, unit: "ms",
+                          help: "길면 천천히 미끄러져요") { value, done in
+                editor.setPortamento(length: value, commitNow: done)
+            }
+            LabeledSlider(title: "시작하는 곳", value: p.start, range: -300...100, unit: "ms",
+                          help: "음수면 섹터가 시작되기 전부터 움직여요") { value, done in
+                editor.setPortamento(start: value, commitNow: done)
+            }
+        }
+    }
+
+    // MARK: 음 높이 다듬기
+
+    private var refineSection: some View {
+        InspectorSection(title: "음 높이 다듬기", icon: "wand.and.stars",
+                         help: "악보에 그린 곡선이나 AutoTuner가 사람 목소리에서 따온 곡선을 고쳐요 (노래 전체는 ⌘A로 다 고른 뒤)") {
+            FlowLayout(spacing: 6) {
+                SmallButton("음 중심 맞추기", icon: "scope") { editor.centerPitch() }
+                    .help("섹터마다 가운데 부분의 높이가 악보 음과 같아지게 옮겨요 (흔들리는 모양은 그대로)")
+                SmallButton("흔들림 줄이기", icon: "arrow.down.right.and.arrow.up.left") { editor.scalePitchDeviation(0.7) }
+                    .help("악보 음에서 벗어난 만큼을 30% 줄여요. 여러 번 누르면 더 곧아져요")
+                SmallButton("흔들림 키우기", icon: "arrow.up.left.and.arrow.down.right") { editor.scalePitchDeviation(1.3) }
+                    .help("벗어난 만큼을 30% 키워서 더 출렁이게 해요")
                 SmallButton("음 높이 부드럽게", icon: "scribble.variable") { editor.smoothPitchOfSelection() }
                     .help("고른 섹터의 음 높이 곡선에서 잔떨림을 골라요 (떨림 설정은 그대로). 여러 번 누르면 더 부드러워져요")
                 SmallButton("그린 곡선 지우기", icon: "arrow.uturn.backward") { editor.resetPitchOfSelection() }
@@ -257,8 +332,7 @@ struct Inspector: View {
     ]
 
     private func isPortamento(_ preset: PortamentoPreset) -> Bool {
-        guard let n = selected.first?.n else { return false }
-        let p = editor.portamento(of: n)
+        guard let id = editor.firstAttachedSelected, let p = editor.portamento(of: id) else { return false }
         return abs(p.length - preset.length) < 1 && abs(p.start - preset.start) < 1 && p.shape == preset.shape
     }
 

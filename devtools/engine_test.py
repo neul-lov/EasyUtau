@@ -262,6 +262,40 @@ def main():
             result["autotuner_compat"] = True
             e.send("open", path=str(path))
 
+        # 음 높이 점 · 앞 섹터와 잇기/끊기 (OpenUtau "이전 노트에 물리기"): 앱이 보낸 점이 모양 · snapFirst까지 그대로
+        # 저장되고 다시 열린다. 아래 내보내기는 이 프로젝트로 한다 (매끄럽게(sp) 모양도 소리가 나는지)
+        cur = e.send("open", path=str(path))["project"]
+        part4 = next(p for p in cur["parts"] if p["kind"] == "voice")
+        pd = e.send("part", part=part4["index"])["part"]
+        ns = [dict(n) for n in pd["notes"]]
+        cut = {"snapFirst": False, "data": [
+            {"x": 0.0, "y": 0.0, "shape": "l"}, {"x": 120.0, "y": 15.0, "shape": "sp"},
+            {"x": 260.0, "y": -8.0, "shape": "sp"}, {"x": 400.0, "y": 0.0, "shape": "io"}]}
+        ns[1]["pitch"] = cut
+        ns[2]["pitch"] = {"snapFirst": True, "data": [
+            {"x": -60.0, "y": 0.0, "shape": "io"}, {"x": 60.0, "y": 0.0, "shape": "o"}]}
+        e.send("setPart", part=part4["index"], notes=ns, curves=pd["curves"], label="command.pitch.point")
+        pitch_path = work / "pitch.ustx"
+        e.send("save", path=str(pitch_path))
+        e.send("new")
+        back = e.send("open", path=str(pitch_path))["project"]
+        part5 = next(p for p in back["parts"] if p["kind"] == "voice")
+        ns5 = e.send("part", part=part5["index"])["part"]["notes"]
+
+        def points(p):
+            return [(round(q["x"], 1), round(q["y"], 1), q["shape"]) for q in p["data"]]
+
+        assert ns5[1]["pitch"]["snapFirst"] is False, ns5[1]["pitch"]
+        assert points(ns5[1]["pitch"]) == points(cut), (points(ns5[1]["pitch"]), points(cut))
+        assert ns5[2]["pitch"]["snapFirst"] is True, ns5[2]["pitch"]
+        assert [round(q["x"], 1) for q in ns5[2]["pitch"]["data"]] == [-60.0, 60.0], ns5[2]["pitch"]
+        if yaml:
+            raw = yaml.safe_load(pitch_path.read_text(encoding="utf-8"))["voice_parts"][0]["notes"]
+            assert raw[1]["pitch"]["snap_first"] is False, raw[1]["pitch"]
+            assert [q["shape"] for q in raw[1]["pitch"]["data"]] == ["l", "sp", "sp", "io"], raw[1]["pitch"]
+        print("음 높이 점 · 끊기 저장 · 다시 열기 좋아요 (모양 l · sp · io, 끊김 · 이어짐)")
+        result["pitch_points"] = True
+
         # 내보내기: 실제로 테토가 부른 소리가 들어 있는지 (파일은 올리지 않는다)
         wav = work / "test.wav"
         e.send("export", path=str(wav), timeout=600)

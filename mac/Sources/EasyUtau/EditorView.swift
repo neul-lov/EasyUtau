@@ -143,12 +143,13 @@ struct EditorView: View {
                 .frame(width: 92, alignment: .leading)
 
             FollowToggle(model: model)
+            LoopToggle(model: model)
 
             divider
 
             Picker("", selection: $editor.tool) {
                 Image(systemName: "music.note").help("섹터: 빈 곳을 누르면 새 섹터, 끌면 옮기기 (1)").tag(PartEditor.Tool.note)
-                Image(systemName: "scribble").help("음 높이: 끌어서 곡선 그리기, ⌥ 끌기로 곡선 밀기 (2)").tag(PartEditor.Tool.pitch)
+                Image(systemName: "scribble").help("음 높이: 선을 잡아 끌면 그 자리에서 접혀요, 빈 곳을 끌면 그리기 (2)").tag(PartEditor.Tool.pitch)
                 Image(systemName: "eraser").help("지우개: 그린 곡선 지우기, 섹터는 눌러서 지우기 (3)").tag(PartEditor.Tool.erase)
             }
             .pickerStyle(.segmented)
@@ -226,17 +227,19 @@ struct EditorView: View {
             switch editor.tool {
             case .note:
                 KeyHint("클릭", "그 음 높이에 새 섹터")
-                KeyHint("끌기", "옮기기 · 오른쪽 끝은 길이 · 빈 곳은 음 높이")
+                KeyHint("끌기", "옮기기 · 끝은 길이 · 빈 곳은 음 높이")
+                KeyHint("⌥ 끌기", "복제")
                 KeyHint("더블클릭", "가사")
                 KeyHint("우클릭", "여기서부터 재생")
                 KeyHint("Space", "들어 보기")
-                KeyHint("↑ ↓", "반음 (⇧ 옥타브)")
+                KeyHint("⌥Space", "고른 곳 반복")
             case .pitch:
-                KeyHint("끌기", "그린 곳 그대로 음 높이")
-                KeyHint("⌥ 끌기", "곡선 잡아 밀기")
-                KeyHint("우클릭", "여기서부터 재생")
-                KeyHint("3", "지우개")
-                KeyHint("1", "섹터로 돌아가기")
+                KeyHint("선 끌기", "그 자리에서 접기")
+                KeyHint("점 끌기", "옮기기 (⌘ 반음 · ⇧ 높이만)")
+                KeyHint("점 두 번", "지우기")
+                KeyHint("⌥ 점", "모양")
+                KeyHint("빈 곳 끌기", "그리기 (⇧ 직선)")
+                KeyHint("이음 표시", "잇기 · 끊기")
             case .erase:
                 KeyHint("끌기", "그린 곡선 지우기")
                 KeyHint("클릭", "섹터 지우기")
@@ -252,6 +255,29 @@ struct EditorView: View {
             }
         }
         .lineLimit(1)
+    }
+}
+
+/// 고른 섹터 반복해서 듣기 (⌥Space)
+struct LoopToggle: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let on = model.loopRange != nil
+        Button { model.toggleLoop() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "repeat")
+                Text("반복")
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(on ? Color.white : Color.primary)
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(on ? AnyShapeStyle(Color.easy.gradient) : AnyShapeStyle(Color.primary.opacity(0.06))))
+        }
+        .buttonStyle(PressableStyle())
+        .help(on ? "고른 곳을 반복해서 듣는 중이에요. 누르면 꺼요 (⌥Space)"
+                 : "고른 섹터를 반복해서 들어요. 들으면서 고치기 좋아요 (⌥Space)")
     }
 }
 
