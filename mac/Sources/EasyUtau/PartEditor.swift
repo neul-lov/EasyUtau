@@ -399,8 +399,11 @@ final class PartEditor: ObservableObject {
         clipboard = selected.map(\.n).sorted { $0.position < $1.position }
         let o = orderedNotes
         if let k = o.firstIndex(where: { selection.contains($0.id) }) {
+            let datas = o.map(\.n)
+            let attached = PitchPoints.isAttached(datas, k, axis: axis, partPosition: position, defaults: defaults)
             copiedSettings = NoteSettings(vibrato: o[k].n.vibrato, exps: o[k].n.exps,
-                                          pitch: PitchPoints.effective(o.map(\.n), k, defaults: defaults))
+                                          pitch: PitchPoints.effective(datas, k, defaults: defaults),
+                                          lead: attached ? (PitchPoints.cents(datas[k - 1]) - PitchPoints.cents(datas[k])) / 10 : nil)
         }
     }
 

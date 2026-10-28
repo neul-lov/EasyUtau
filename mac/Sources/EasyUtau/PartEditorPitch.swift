@@ -5,6 +5,8 @@ struct NoteSettings {
     var vibrato: VibratoData
     var exps: [NoteExpData]
     var pitch: PitchData
+    /// 앞 섹터에서 이어 부르던 섹터면 그 앞 섹터 높이 (0.1 반음, 붙여 넣을 때 그 부분은 빼고 가져온다)
+    var lead: Double?
 }
 
 /// 음 높이 점 · 섹터 잇기/끊기 · 모양 넣기 · 다듬기를 편집 화면에 붙인다 (계산은 PitchPoints).
@@ -330,8 +332,8 @@ extension PartEditor {
         for k in o.indices where selection.contains(o[k].id) {
             datas[k].vibrato = s.vibrato
             datas[k].exps = s.exps
-            (datas, c) = PitchPoints.pasting(s.pitch, into: datas, k, pitd: c, axis: axis, partPosition: position,
-                                             defaults: defaults)
+            (datas, c) = PitchPoints.pasting(s.pitch, lead: s.lead, into: datas, k, pitd: c, axis: axis,
+                                             partPosition: position, defaults: defaults)
         }
         var changed = apply(datas, ids: o.map(\.id))
         if c != pitd {
