@@ -259,6 +259,40 @@ final class PitchPointsTests: XCTestCase {
         XCTAssertEqual(g.data[1].y, -40)
     }
 
+    func testPortamentoFromNoteStartStaysAttached() {
+        // AutoTuner 점에 "꺾어 올리기"(섹터 시작에서 출발): 그래도 앞 섹터 높이에서 출발하니 이어진 것
+        var notes = [note(0, 480, 60, pitch: PitchData(snapFirst: false, data: [pt(0, 0), pt(5, 0)])), note(480, 480, 64)]
+        notes[1].pitch = autoTunerPitch(from: 60, to: 64, width: 60)
+        let p = PitchPoints.withPortamento(notes, 1, start: 0, length: 90, shape: .i, axis: axis, partPosition: 0,
+                                           defaults: defaults)
+        XCTAssertEqual(p.data.map(\.x), [-5, 0, 90])
+        notes[1].pitch = p
+        XCTAssertTrue(PitchPoints.isAttached(notes, 1, axis: axis, partPosition: 0, defaults: defaults))
+        let s = sung(notes, empty, from: 0, to: 955)
+        XCTAssertEqual(s[480]!, 6000, accuracy: 0.5)
+        XCTAssertEqual(s[600]!, 6400, accuracy: 0.5)
+        // 끊으면 앞 섹터 높이에 머물던 점까지 빠져서 섹터 시작부터 제 음
+        let cut = PitchPoints.settingAttached(false, notes: notes, indices: [1], pitd: empty, axis: axis, partPosition: 0,
+                                              defaults: defaults)
+        XCTAssertEqual(cut.notes[1].pitch!.data.map(\.x), [0, 90])
+        let c = sung(cut.notes, cut.pitd, from: 0, to: 955)
+        for t in stride(from: 480, to: 960, by: 5) { XCTAssertEqual(c[t]!, 6400, accuracy: 0.5, "tick \(t)") }
+        // 첫 점을 섹터 시작 뒤로 옮겨도 앞 섹터 높이면 이어진 것
+        notes[1].pitch = PitchData(snapFirst: false, data: [pt(20, -40), pt(80, 0)])
+        XCTAssertTrue(PitchPoints.isAttached(notes, 1, axis: axis, partPosition: 0, defaults: defaults))
+    }
+
+    func testSamePitchCutAndJoin() {
+        let notes = [note(0, 480, 60), note(480, 480, 60)]
+        XCTAssertTrue(PitchPoints.isAttached(notes, 1, axis: axis, partPosition: 0, defaults: defaults))
+        let cut = PitchPoints.settingAttached(false, notes: notes, indices: [1], pitd: empty, axis: axis, partPosition: 0,
+                                              defaults: defaults)
+        XCTAssertFalse(PitchPoints.isAttached(cut.notes, 1, axis: axis, partPosition: 0, defaults: defaults))
+        let joined = PitchPoints.settingAttached(true, notes: cut.notes, indices: [1], pitd: cut.pitd, axis: axis,
+                                                 partPosition: 0, defaults: defaults)
+        XCTAssertTrue(PitchPoints.isAttached(joined.notes, 1, axis: axis, partPosition: 0, defaults: defaults))
+    }
+
     // MARK: 모양 넣기
 
     func testPresetsKeepAttachment() {
@@ -296,9 +330,16 @@ final class PitchPointsTests: XCTestCase {
         let notes = [note(0, 480, 60), note(480, 480, 64), note(1200, 240, 62)]
         // 앞 섹터에서 이어 오던 점을 떨어진 섹터에 붙여도 그 섹터는 끊긴 채로
         let source = autoTunerPitch(from: 60, to: 64, width: 60)
-        let r = PitchPoints.pasting(source, into: notes, 2, pitd: empty, axis: axis, partPosition: 0, defaults: defaults)
+        let r = PitchPoints.pasting(source, lead: -40, into: notes, 2, pitd: empty, axis: axis, partPosition: 0,
+                                    defaults: defaults)
         XCTAssertFalse(PitchPoints.isAttached(r.notes, 2, axis: axis, partPosition: 0, defaults: defaults))
         XCTAssertTrue(r.notes[2].pitch!.data.allSatisfy { $0.x >= 0 })
+        // 섹터 시작부터 앞 섹터 높이에 머물던 점도 빼고 가져온다 (붙인 섹터가 엉뚱한 높이에서 시작하지 않게)
+        let late = PitchData(snapFirst: false, data: [pt(-5, -40), pt(0, -40, .i), pt(90, 0), pt(200, 6)])
+        let r2 = PitchPoints.pasting(late, lead: -40, into: notes, 2, pitd: empty, axis: axis, partPosition: 0,
+                                     defaults: defaults)
+        XCTAssertEqual(r2.notes[2].pitch!.data.map(\.x), [0, 90, 200])
+        XCTAssertEqual(r2.notes[2].pitch!.data[0].y, 0)
         // 섹터 길이(250ms)를 넘는 점은 잘린다
         let long = PitchData(snapFirst: true, data: [pt(-40, 0), pt(40, 0), pt(400, 10), pt(600, 0)])
         let fit = PitchPoints.fitted(long, durationMs: 250)

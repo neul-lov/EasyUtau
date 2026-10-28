@@ -81,7 +81,22 @@ enum PitchPoints {
         let pd = data(of: n, defaults: defaults)
         if pd.snapFirst { return p.end == n.position }
         guard let first = pd.data.first else { return false }
-        return first.x < 0 && abs(first.y - (cents(p) - cents(n)) / 10) < 0.6
+        // 첫 점이 앞 섹터 높이면 이어 부른다 (첫 점이 섹터 시작 뒤에 있어도 섹터 시작부터 그 높이다).
+        // 같은 높이끼리는 섹터 앞에서 출발할 때만: 끊은 것((0, 0)에서 시작)과 구별하려고
+        let diff = (cents(p) - cents(n)) / 10
+        return abs(first.y - diff) < 0.6 && (first.x < 0 || abs(diff) >= 0.6)
+    }
+
+    /// 섹터 안쪽 점만: 앞 섹터 높이(lead, 0.1 반음)에서 출발하던 앞쪽 점을 빼고 섹터 시작은 제 높이에서.
+    static func body(_ d: [PitchPointData], lead: Double?) -> [PitchPointData] {
+        var out = d.filter { $0.x >= 0 }
+        if let lead, abs(lead) >= 0.6 {
+            while let f = out.first, abs(f.y - lead) < 0.6 { out.removeFirst() }
+        }
+        if out.first.map({ $0.x > 0.5 }) ?? true {
+            out.insert(PitchPointData(x: 0, y: 0, shape: d.first?.shape ?? .io), at: 0)
+        }
+        return out
     }
 
     /// 뒤 섹터의 곡선이 이 섹터가 끝나기 전에 시작하는지. 그러면 이 섹터 끝 점 높이를 바꾸면 두 곡선이 겹쳐 더해진다
@@ -266,10 +281,7 @@ enum PitchPoints {
         let n = notes[k]
         let old = effective(notes, k, defaults: defaults).data
         let nDur = durationMs(n, axis: axis, partPosition: partPosition)
-        var d = old.filter { $0.x >= 0 }
-        if d.first.map({ $0.x > 0 }) ?? true {
-            d.insert(PitchPointData(x: 0, y: 0, shape: old.first?.shape ?? .io), at: 0)
-        }
+        var d = body(old, lead: (cents(notes[pk]) - cents(n)) / 10)
         if d.count < 2 {
             d.append(PitchPointData(x: max(d[0].x + 1, min(nDur, d[0].x + 5)), y: d[0].y, shape: d[0].shape))
         }
@@ -371,8 +383,10 @@ enum PitchPoints {
         let y0 = d[0].y
         let target = d[j + 1]
         var out: [PitchPointData] = []
-        if gap > 0.5, !pd.snapFirst, x0 > -gap + 1 {
-            out.append(PitchPointData(x: (-gap * 10).rounded() / 10, y: y0, shape: .io))
+        // 앞 섹터 높이에서 출발하는 것을 남긴다: 앞 섹터가 끝나는 곳(붙어 있으면 5ms 앞)부터 시작점까지 앞 섹터 높이
+        if !pd.snapFirst, isAttached(notes, k, axis: axis, partPosition: partPosition, defaults: defaults) {
+            let hold = gap > 0.5 ? -gap : -5
+            if x0 > hold + 1 { out.append(PitchPointData(x: (hold * 10).rounded() / 10, y: y0, shape: .io)) }
         }
         out.append(PitchPointData(x: (x0 * 10).rounded() / 10, y: y0, shape: shape ?? cur.shape))
         out.append(PitchPointData(x: (x1 * 10).rounded() / 10, y: target.y, shape: target.shape))
@@ -395,8 +409,9 @@ enum PitchPoints {
     }
 
     /// 다른 섹터의 음 높이 점을 이 섹터에: 섹터 안쪽 모양만 가져오고, 앞 섹터와 잇거나 끊긴 것은 이 섹터 그대로 둔다.
-    static func pasting(_ source: PitchData, into notes: [NoteData], _ k: Int, pitd: CurveData, axis: TimeAxis,
-                        partPosition: Int, defaults: EngineDefaults) -> (notes: [NoteData], pitd: CurveData) {
+    /// lead: 가져온 섹터가 앞 섹터에서 이어 부르던 높이 (그 섹터의 앞 섹터 높이, 0.1 반음)
+    static func pasting(_ source: PitchData, lead: Double? = nil, into notes: [NoteData], _ k: Int, pitd: CurveData,
+                        axis: TimeAxis, partPosition: Int, defaults: EngineDefaults) -> (notes: [NoteData], pitd: CurveData) {
         guard !source.data.isEmpty else { return (notes, pitd) }
         var notes = notes
         let hasPrev = previous(notes, k, axis: axis, partPosition: partPosition) != nil
@@ -404,9 +419,7 @@ enum PitchPoints {
         var p = source
         if !p.snapFirst {
             // 앞 섹터 높이로 적어 둔 앞쪽 점은 그 섹터의 앞 섹터 것이라 뺀다
-            var d = p.data.filter { $0.x >= 0 }
-            if d.first.map({ $0.x > 0.5 }) ?? true { d.insert(PitchPointData(x: 0, y: 0, shape: source.data[0].shape), at: 0) }
-            p.data = d
+            p.data = body(p.data, lead: lead)
         }
         notes[k].pitch = fitted(p, durationMs: durationMs(notes[k], axis: axis, partPosition: partPosition))
         guard hasPrev, isAttached(notes, k, axis: axis, partPosition: partPosition, defaults: defaults) != wasAttached else {
