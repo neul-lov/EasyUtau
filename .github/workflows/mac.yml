@@ -59,6 +59,16 @@ jobs:
           path: mac/build/engine/EasyUtauEngine.dll
           retention-days: 7
 
+  unit:
+    name: 음 높이 계산 시험
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: swift test (점 끌기 · 잇기/끊기 · 다듬기)
+        run: cd mac && swift test
+
   engine:
     name: 엔진 시험 (실제 음원으로, 소리 재생 없음)
     # 다른 사람 저장소(포크)에서 온 PR에서는 테토 음원을 받지 않아요
