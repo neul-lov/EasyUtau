@@ -239,6 +239,20 @@ def main():
         assert not r["done"] and r["project"]["saved"], "되돌릴 것이 없는데 무언가 되돌렸어요"
         print("저장됨 표시 · 되돌릴 것 없음 좋아요")
 
+        # 섹터 지우기 (⌫): 앱처럼 지운 섹터만 뺀 목록을 보내면 엔진에서도 빠지고, ⌘Z로 돌아온다
+        pd2 = e.send("part", part=part2["index"])["part"]
+        kept = [dict(n) for i, n in enumerate(pd2["notes"]) if i != 2]
+        r = e.send("setPart", part=part2["index"], notes=kept, curves=pd2["curves"], label="command.note.delete")
+        left = r["part"]["notes"]
+        assert [n["lyric"] for n in left] == [n["lyric"] for n in kept], ([n["lyric"] for n in left], len(kept))
+        assert [n["position"] for n in left] == [n["position"] for n in kept]
+        r = e.send("undo")
+        assert r["done"] and r["label"] == "command.note.delete", r.get("label")
+        restored = e.send("part", part=part2["index"])["part"]["notes"]
+        assert [n["lyric"] for n in restored] == [n["lyric"] for n in pd2["notes"]], "되돌리기가 지운 섹터를 살리지 않았어요"
+        print(f"섹터 지우기 · 되돌리기 좋아요 ({len(pd2['notes'])}개 → {len(left)}개 → {len(restored)}개)")
+        result["delete_note"] = True
+
         # AutoTuner와 같은 파일 쓰기: AutoTuner(파이썬 yaml)가 읽고 고쳐 쓴 파일을 다시 연다
         try:
             import yaml

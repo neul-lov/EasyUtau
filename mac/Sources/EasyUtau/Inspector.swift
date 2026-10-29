@@ -90,6 +90,11 @@ struct Inspector: View {
                     .lineLimit(1)
             }
             Spacer()
+            if !selected.isEmpty {
+                CircleIconButton(icon: "trash", help: "고른 섹터 지우기 (⌫)", tint: .red, size: 24) {
+                    editor.deleteSelection()
+                }
+            }
             CircleIconButton(icon: "sidebar.right", help: "세부 설정 창 닫기 (⌘0)", size: 24) {
                 editor.inspectorOpen = false
             }
