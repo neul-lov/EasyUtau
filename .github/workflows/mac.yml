@@ -66,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
-      - name: swift test (점 끌기 · 잇기/끊기 · 다듬기)
+      - name: swift test (점 끌기 · 잇기/끊기 · 다듬기 · 가사 칸 ⌫)
         run: cd mac && swift test
 
   engine:

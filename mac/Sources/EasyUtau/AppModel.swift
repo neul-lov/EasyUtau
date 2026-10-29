@@ -395,6 +395,7 @@ final class AppModel: ObservableObject {
     /// 다른 앱에서 돌아왔을 때 (앱 대리자가 부른다)
     func becameActive() {
         refreshAutoTuner()
+        editor?.canvas?.takeKeysIfIdle()
         Task { await checkDisk() }
     }
 
