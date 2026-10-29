@@ -826,6 +826,8 @@ final class PianoRollView: NSView {
     private(set) var lyricNote: Int?
     private var lyricOpenedWith = ""
     private var movingLyric = false
+    /// 빈 곳을 눌러 방금 만든 섹터 (가사를 아직 안 고쳤으면 ⌫가 섹터를 없앤다)
+    private var lyricNewNote: Int?
 
     private var inOrder: [EditNote] { editor?.notes.sorted { ($0.n.position, $0.n.tone) < ($1.n.position, $1.n.tone) } ?? [] }
 
@@ -837,6 +839,7 @@ final class PianoRollView: NSView {
 
     private func showLyricField(for id: Int) {
         if lyricNote != nil { commitLyric() }
+        lyricNewNote = nil
         guard let e = editor, let n = e.notes.first(where: { $0.id == id }) else { return endLyric() }
         let visible = Double((bounds.width - keyW) / e.pxPerTick)
         if Double(n.n.position) < e.viewStart || Double(n.n.end) > e.viewStart + visible * 0.9 {
@@ -902,9 +905,33 @@ final class PianoRollView: NSView {
         guard lyricNote != nil else { return }
         if commit { commitLyric() } else { editor?.commitStaged() }
         lyricNote = nil
+        lyricNewNote = nil
         lyricField?.removeFromSuperview()
         window?.makeFirstResponder(self)
         needsDisplay = true
+    }
+
+    /// 가사 칸을 아무것도 넣지 않고 닫는다 (그 섹터를 지울 때: 친 글자는 버린다)
+    func dropLyric() {
+        guard lyricNote != nil else { return }
+        lyricNote = nil
+        lyricNewNote = nil
+        lyricField?.removeFromSuperview()
+        window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
+    /// 글자를 치는 칸이 없으면 키(⌫ · Space · 1 2 3 …)를 악보가 받는다
+    func takeKeysIfIdle() {
+        guard let w = window, !(w.firstResponder is NSTextView || w.firstResponder is NSTextField),
+              w.firstResponder !== self else { return }
+        w.makeFirstResponder(self)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // 편집 화면을 열면 키가 바로 악보로 (창에 키를 받는 곳이 없으면 글자 칸이 저절로 잡을 수 있다)
+        DispatchQueue.main.async { [weak self] in self?.takeKeysIfIdle() }
     }
 
     // MARK: 알림 (편집 모델에서)
@@ -1233,6 +1260,7 @@ final class PianoRollView: NSView {
             // 빈 곳 클릭: 그 음 높이에 새 섹터, 바로 가사 입력 (가사를 넣을 때 함께 보낸다: 되돌리기 한 칸)
             let id = e.addNote(at: tick(p.x), tone: tone(p.y), commitNow: false)
             beginLyric(id)
+            if lyricNote == id { lyricNewNote = id }
         case .pitch:
             if changed { e.finishPitchEdit("command.pitch.draw") } else { e.cancelPitchEdit() }
             readout = nil
@@ -1366,6 +1394,14 @@ extension PianoRollView: NSTextFieldDelegate {
             moveLyric(-1)
         case #selector(NSResponder.cancelOperation(_:)):
             endLyric()
+        case #selector(NSResponder.deleteBackward(_:)), #selector(NSResponder.deleteForward(_:)):
+            // 빈 칸에서, 또는 방금 만든 섹터를 아무것도 안 고친 채로 ⌫ → 그 섹터를 지운다
+            guard let id = lyricNote, let e = editor,
+                  LyricKeys.deletesNote(text: textView.string, selected: textView.selectedRanges.first?.rangeValue,
+                                        openedWith: lyricOpenedWith, isNew: id == lyricNewNote,
+                                        composing: textView.hasMarkedText()) else { return false }
+            e.selection = [id]
+            e.deleteSelection()
         default:
             return false
         }
@@ -1377,6 +1413,7 @@ extension PianoRollView: NSTextFieldDelegate {
         guard !movingLyric, lyricNote != nil else { return }
         commitLyric()
         lyricNote = nil
+        lyricNewNote = nil
         DispatchQueue.main.async { [weak self] in
             guard let self, self.lyricNote == nil else { return }
             self.lyricField?.removeFromSuperview()
@@ -1387,6 +1424,17 @@ extension PianoRollView: NSTextFieldDelegate {
 
 /// 섹터 가사를 입력하는 작은 칸
 final class LyricField: NSTextField {}
+
+/// 가사 칸에서 ⌫ · Delete를 눌렀을 때 글자를 지울지, 섹터를 지울지.
+enum LyricKeys {
+    /// 칸이 비었거나, 방금 만든 섹터의 가사를 아무것도 안 고친 채로 (처음처럼 다 골라진 채로) 누르면 섹터를 지운다.
+    /// 한글을 조합하는 중이면 글자를 지운다.
+    static func deletesNote(text: String, selected: NSRange?, openedWith: String, isNew: Bool, composing: Bool) -> Bool {
+        if composing { return false }
+        if text.isEmpty { return true }
+        return isNew && text == openedWith && selected == NSRange(location: 0, length: (text as NSString).length)
+    }
+}
 
 struct PianoRoll: NSViewRepresentable {
     @ObservedObject var editor: PartEditor

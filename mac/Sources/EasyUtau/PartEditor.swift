@@ -78,6 +78,10 @@ final class PartEditor: ObservableObject {
     private var sentVersion = 0
     /// 아직 안 보낸 고친 것의 이름 (새 섹터를 놓고 가사를 치는 동안: 섹터 넣기와 가사가 되돌리기 한 칸)
     private var stagedLabel: String?
+    /// 빈 곳을 눌러 만들고 아직 엔진에 안 보낸 섹터 (가사를 치는 동안)
+    private var stagedNote: Int?
+    /// 고친 것이 없던 때의 발음 준비 상태 (안 보낸 새 섹터를 거둬들일 때 되살린다)
+    private var readyBeforeStage = false
     /// 보내는 중에 또 고친 것의 이름 (끝나고 한 번 더 보낼 때 쓴다)
     private var nextLabel: String?
     /// 다른 프로젝트를 열어서 버린 편집 화면: 더는 엔진에 보내지 않는다
@@ -234,6 +238,7 @@ final class PartEditor: ObservableObject {
 
     /// 고친 것을 기억만 하고 아직 보내지 않는다. 다음 commit · commitStaged · flush 때 함께 간다 (되돌리기 한 칸).
     func stage(_ label: String) {
+        if sentVersion == version, !syncing { readyBeforeStage = phonemesReady }
         version += 1
         phonemesReady = false
         sortNotes()
@@ -264,6 +269,7 @@ final class PartEditor: ObservableObject {
             let v = version
             let name = stagedLabel ?? nextLabel ?? label
             stagedLabel = nil
+            stagedNote = nil
             nextLabel = nil
             let args: [String: Any] = [
                 "part": partIndex,
@@ -331,14 +337,31 @@ final class PartEditor: ObservableObject {
         notes.append(EditNote(id: id, n: data))
         selection = [id]
         preview.play(data.tone)
-        if commitNow { commit("command.note.add") } else { stage("command.note.add") }
+        if commitNow {
+            commit("command.note.add")
+        } else {
+            stage("command.note.add")
+            stagedNote = id
+        }
         return id
     }
 
     func deleteSelection() {
         guard !selection.isEmpty else { return }
-        notes.removeAll { selection.contains($0.id) }
+        let removed = selection
+        canvas?.dropLyric()  // 가사를 치던 섹터면 칸을 닫는다 (지우니까 친 글자는 버린다)
+        notes.removeAll { removed.contains($0.id) }
         selection = []
+        if let fresh = stagedNote, removed.contains(fresh) {
+            stagedNote = nil
+            stagedLabel = nil
+            // 빈 곳을 잘못 눌러 만든 섹터를 바로 지운 것: 엔진에 아직 안 갔으니 보낼 것도 없다 (빈 되돌리기 칸이 안 생긴다)
+            if removed.count == 1, !syncing, version == sentVersion + 1 {
+                version = sentVersion
+                phonemesReady = phonemesReady || readyBeforeStage
+                return
+            }
+        }
         commit("command.note.delete")
     }
 
@@ -762,6 +785,7 @@ final class PartEditor: ObservableObject {
             case kVK_ANSI_V where flags.contains(.option): pasteSettings()
             case kVK_ANSI_V: paste(at: (model?.startTick ?? position) - position)
             case kVK_ANSI_D: duplicateSelection()
+            case kVK_Delete: deleteKey()
             case kVK_ANSI_Equal: zoom(1.3)
             case kVK_ANSI_Minus: zoom(1 / 1.3)
             default: return false
@@ -770,7 +794,7 @@ final class PartEditor: ObservableObject {
         }
         guard flags.subtracting(.shift).isEmpty else { return false }
         switch key {
-        case kVK_Delete, kVK_ForwardDelete: deleteSelection()
+        case kVK_Delete, kVK_ForwardDelete: deleteKey()
         case kVK_UpArrow, kVK_DownArrow:
             // 고른 섹터가 없으면 아무것도 안 한다 (예전에는 노래 전체가 올라갔다)
             guard !selection.isEmpty else { return false }
@@ -797,6 +821,15 @@ final class PartEditor: ObservableObject {
         default: return false
         }
         return true
+    }
+
+    /// ⌫ · Delete (⌘⌫도): 고른 섹터 지우기. 고른 게 없으면 어떻게 고르는지 알려 준다.
+    private func deleteKey() {
+        guard !selection.isEmpty else {
+            model?.show("지울 섹터를 먼저 눌러서 골라 주세요", success: false)
+            return
+        }
+        deleteSelection()
     }
 }
 
