@@ -230,6 +230,7 @@ struct EditorView: View {
                 KeyHint("끌기", "옮기기 · 끝은 길이 · 빈 곳은 음 높이")
                 KeyHint("⌥ 끌기", "복제")
                 KeyHint("더블클릭", "가사")
+                KeyHint("⌫", "지우기")
                 KeyHint("우클릭", "여기서부터 재생")
                 KeyHint("Space", "들어 보기")
                 KeyHint("⌥Space", "고른 곳 반복")
