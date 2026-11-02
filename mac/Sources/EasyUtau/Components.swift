@@ -292,3 +292,29 @@ enum TrackColors {
         NSColor.hex(named.first { $0.name == name }?.hex ?? name) ?? .easy
     }
 }
+
+/// 소리 만드는 진행 막대. 늘 같은 자리 · 같은 크기를 차지해서, 나타나고 사라질 때 화면이 흔들리지 않는다.
+struct RenderProgressBadge: View {
+    let progress: (value: Double, info: String)?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ProgressView(value: progress?.value ?? 0, total: 100)
+                .progressViewStyle(.linear)
+                .controlSize(.small)
+                .frame(width: 70)
+            Text(progress.map { $0.info.isEmpty ? "소리 만드는 중" : $0.info } ?? "소리 만드는 중")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: 110, alignment: .leading)
+        }
+        .frame(width: 186, height: 16)
+        .clipped()
+        .opacity(progress == nil ? 0 : 1)
+        .animation(nil, value: progress?.value)
+        .allowsHitTesting(false)
+        .accessibilityHidden(progress == nil)
+    }
+}
