@@ -23,6 +23,11 @@ class Engine:
         env = dict(os.environ)
         env["EASYUTAU_NO_AUDIO"] = "1"
         env["EASYUTAU_CACHE"] = str(work / "cache")
+        # 앱에 든 엔진이면 앱과 같은 .NET 설정을 넣는다 (이미 정한 값이 있으면 그것)
+        bundle = host / "BUNDLE.json"
+        if bundle.exists():
+            for k, v in json.loads(bundle.read_text(encoding="utf-8")).get("env", {}).items():
+                env.setdefault(k, str(v))
         self.proc = subprocess.Popen(
             [str(host / "EasyUtauEngine"), "EasyUtauEngine.dll"],
             cwd=str(host), env=env,

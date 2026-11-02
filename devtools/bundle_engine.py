@@ -5,7 +5,9 @@ OpenUtau Mac 판(self-contained: .NET 런타임이 통째로 들어 있다)의 �
 2. 엔진이 쓰지 않는 화면용 파일(Avalonia · Skia · 업데이트 등)을 뺀다:
    엔진에게 직접 물어(--closure) OpenUtau.Core · 기본 발음 방식 · 엔진에서 참조로 닿는 어셈블리만 남기고,
    .NET 런타임 자체와 OpenUtau.Core가 쓰는 네이티브 파일(worldline · onnxruntime · SDL 등)은 그대로 둔다.
-3. 런타임 설정(runtimeconfig)에 메모리 · CPU 설정을 넣는다 (--gc 로 고른다).
+3. 메모리 · CPU용 .NET 설정(환경 변수)을 BUNDLE.json의 "env"에 적는다 (--gc 로 고른다).
+   엔진 실행 파일은 OpenUtau 실행 파일의 복사본이라 `EasyUtauEngine EasyUtauEngine.dll`처럼 dll을 첫 인자로 받는
+   방식으로 돈다. 그래서 runtimeconfig를 고치는 대신, 앱(Engine.swift)과 시험 도구가 켤 때 환경 변수로 넣는다.
 
 사용: python devtools/bundle_engine.py <OpenUtau.app 또는 그 Contents/MacOS> <EasyUtauEngine.dll> <만들 폴더> [--gc 이름]
 결과 폴더 안 BUNDLE.json에 OpenUtau 버전 · 뺀 파일 · 크기를 적는다.
@@ -22,13 +24,13 @@ from engine_host import prepare  # noqa: E402
 # 엔진은 화면을 그리지 않는다: 이 이름이 들어간 네이티브 파일은 Avalonia 화면 전용
 UI_NATIVE = ("skiasharp", "harfbuzzsharp", "avalonianative", "libsparkle", "sparkle")
 
-# 런타임 설정 묶음 (engine_bench.py로 비교해서 고른다). 소리 결과는 바꾸지 않는 것만.
+# .NET 설정 묶음 (engine_bench.py로 비교해서 고른다). 소리 결과는 바꾸지 않는 것만.
 GC_PRESETS = {
     "default": {},
     # 백그라운드 GC 스레드를 끄고 (엔진은 작은 일만 해서 멈춤이 짧다) 힙을 더 자주 줄인다
-    "lean": {"System.GC.Concurrent": False, "System.GC.ConserveMemory": 5},
-    "noconcurrent": {"System.GC.Concurrent": False},
-    "conserve": {"System.GC.ConserveMemory": 5},
+    "lean": {"DOTNET_gcConcurrent": "0", "DOTNET_GCConserveMemory": "5"},
+    "noconcurrent": {"DOTNET_gcConcurrent": "0"},
+    "conserve": {"DOTNET_GCConserveMemory": "5"},
 }
 
 
@@ -69,7 +71,7 @@ def bundle(openutau: Path, engine_dll: Path, out: Path, gc: str) -> dict:
     full = size_of(openutau)
     host = prepare(openutau, engine_dll, out)
     keep_runtime = runtime_files(host)
-    closure = subprocess.run([str(host / "EasyUtauEngine"), "--closure"], cwd=str(host),
+    closure = subprocess.run([str(host / "EasyUtauEngine"), "EasyUtauEngine.dll", "--closure"], cwd=str(host),
                              capture_output=True, text=True, timeout=120)
     if closure.returncode != 0:
         raise SystemExit("엔진에게 쓰는 파일 목록을 받지 못했어요:\n" + closure.stderr[-2000:])
@@ -93,16 +95,9 @@ def bundle(openutau: Path, engine_dll: Path, out: Path, gc: str) -> dict:
             f.unlink()
     # 하위 폴더는 그대로 둔다 (발음 사전 · 모델 등이 있을 수 있음)
 
-    # 런타임 설정: OpenUtau.dll(=엔진) 실행에 쓰이는 OpenUtau.runtimeconfig.json
-    rc_path = host / "OpenUtau.runtimeconfig.json"
-    rc = json.loads(rc_path.read_text(encoding="utf-8-sig"))
-    props = rc.setdefault("runtimeOptions", {}).setdefault("configProperties", {})
-    props.update(GC_PRESETS[gc])
-    rc_path.write_text(json.dumps(rc, indent=2))
-
     info = {
         "gc": gc,
-        "gc_settings": GC_PRESETS[gc],
+        "env": GC_PRESETS[gc],
         "openutau_bytes": full,
         "bundle_bytes": size_of(host),
         "removed": removed,

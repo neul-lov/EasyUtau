@@ -188,6 +188,15 @@ final class Engine: @unchecked Sendable {
         return p.terminationStatus
     }
 
+    static func bundleEnv(_ host: URL) -> [String: String] {
+        guard let data = try? Data(contentsOf: host.appendingPathComponent("BUNDLE.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = obj["env"] as? [String: Any] else { return [:] }
+        var out: [String: String] = [:]
+        for (k, v) in env where k.hasPrefix("DOTNET_") { out[k] = "\(v)" }
+        return out
+    }
+
     // MARK: 켜기 · 주고받기
 
     private var process: Process?
@@ -220,6 +229,8 @@ final class Engine: @unchecked Sendable {
         env["EASYUTAU_CACHE"] = Self.cacheDir.path
         env["EASYUTAU_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         env["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
+        // 앱에 든 엔진: 만들 때 고른 .NET 메모리 · CPU 설정 (BUNDLE.json "env", 이미 정한 값이 있으면 그것)
+        for (k, v) in Self.bundleEnv(host) where env[k] == nil { env[k] = v }
         p.environment = env
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         p.standardInput = stdin
