@@ -628,15 +628,7 @@ struct TracksView: View {
             }
             Spacer(minLength: 8)
 
-            if let p = model.renderProgress {
-                HStack(spacing: 6) {
-                    ProgressView(value: p.value, total: 100).controlSize(.small).frame(width: 70)
-                    Text(p.info.isEmpty ? "소리 만드는 중" : p.info)
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
+            RenderProgressBadge(progress: model.renderProgress)
 
             FollowToggle(model: model)
             tempoField
