@@ -57,7 +57,7 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 Image(systemName: "music.note.list")
                     .font(.system(size: 38, weight: .light))
-                Text("프로젝트 파일(ustx · ust · mid)이나 소리 파일을 놓으세요")
+                Text("프로젝트 파일(ustx · ust · mid), 소리 파일, 가수 음원(zip)을 놓으세요")
                     .font(.system(size: 15, weight: .semibold))
             }
             .foregroundStyle(Color.easy)
@@ -170,8 +170,9 @@ struct Sidebar: View {
             Button("OpenUtau에서 열기") { model.openInOpenUtau() }
                 .disabled(model.project?.path.isEmpty != false)
             Divider()
+            Button("가수 음원 넣기 (zip)…") { model.installSingerPanel() }
             Button("가수 목록 새로 읽기") { model.refreshSingers() }
-            Button("OpenUtau 가수 폴더 열기") { model.revealSingers() }
+            Button("가수 폴더 열기") { model.revealSingers() }
             Button("엔진 기록 보기") { NSWorkspace.shared.open(Engine.logURL) }
             Divider()
             Button("EasyUtau 종료") { NSApp.terminate(nil) }
@@ -237,11 +238,14 @@ struct Sidebar: View {
         VStack(spacing: 2) {
             SectionTitle(title: "가수 (음원)", icon: "person.wave.2")
             if model.singers.isEmpty {
-                Text("OpenUtau 가수 폴더에 음원이 없어요. 음원을 넣고 ‘가수 목록 새로 읽기’를 눌러 주세요.")
+                Text("가수 음원이 없어요. 음원 묶음(zip)을 창에 끌어다 놓거나 아래 단추로 넣어 주세요.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
                     .fixedSize(horizontal: false, vertical: true)
+                Button("가수 음원 넣기…") { model.installSingerPanel() }
+                    .controlSize(.small)
+                    .padding(.horizontal, 10)
             }
             ForEach(model.singers.prefix(10)) { singer in
                 Button {
@@ -370,7 +374,7 @@ struct NeedsOpenUtauView: View {
                 .foregroundStyle(Color.easy)
             Text("OpenUtau가 필요해요")
                 .font(.system(size: 17, weight: .bold))
-            Text("EasyUtau는 OpenUtau의 소리 만드는 부분을 그대로 써요. OpenUtau를 응용 프로그램 폴더에 넣고 다시 켜 주세요.\n(가수 음원과 설정도 OpenUtau와 같이 써요.)")
+            Text("이 Mac(인텔)에서는 EasyUtau에 든 엔진을 쓸 수 없어서, 깔아 둔 OpenUtau의 소리 만드는 부분을 써요. OpenUtau를 응용 프로그램 폴더에 넣고 다시 켜 주세요.\n(가수 음원과 설정도 OpenUtau와 같이 써요.)")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)

@@ -8,18 +8,20 @@ AutoTuner(자동 조교)에서 음표를 누르면 이 앱으로 넘어와서 �
 
 ## 어떻게 돌아가나요
 
-EasyUtau는 소리를 스스로 만들지 않아요. 내 Mac에 깔린 **OpenUtau의 엔진을 그대로** 써요.
+EasyUtau는 **OpenUtau의 엔진을 그대로** 써서 소리를 만들어요. Apple Silicon Mac에서는 그 엔진(OpenUtau 0.1.576의
+.NET 런타임 · OpenUtau.Core · 발음 방식 · worldline, 화면용 파일만 뺌)이 **앱 안에 들어 있어서 OpenUtau를 따로 깔지 않아도 돼요**.
 
-- 가수(음원) · 설정은 OpenUtau와 같이 써요 (`~/Library/OpenUtau`). 따로 설치할 게 없어요.
+- 가수(음원) · 설정은 OpenUtau와 같은 곳을 써요 (`~/Library/OpenUtau`). OpenUtau에 넣어 둔 음원은 그대로 보이고,
+  OpenUtau가 없으면 음원 묶음(zip 등)을 창에 끌어다 놓거나 메뉴의 **가수 음원 넣기**로 넣어요.
 - 파일은 OpenUtau와 똑같은 `.ustx`예요. EasyUtau에서 고친 걸 OpenUtau에서 열 수 있고, 반대도 돼요.
 - 되돌리기(⌘Z)도 OpenUtau의 되돌리기를 그대로 써서, 어떤 고치기든 한 번에 되돌아가요.
 - 들어 보기는 OpenUtau와 같은 방식으로 그때그때 소리를 만들어요 (고친 곳만 다시 만들어서 빨라요).
 
-그래서 **OpenUtau가 응용 프로그램 폴더에 있어야** 해요 ([받는 곳](https://github.com/stakira/OpenUtau/releases/latest)).
+인텔 Mac에서는 앱에 든 엔진을 쓸 수 없어서 **OpenUtau가 응용 프로그램 폴더에 있어야** 해요 ([받는 곳](https://github.com/stakira/OpenUtau/releases/latest)).
 
 ## 설치
 
-1. OpenUtau(Mac)와 쓰고 싶은 음원을 설치해 둬요.
+1. 쓰고 싶은 음원 묶음(zip)을 받아 둬요 (OpenUtau에 이미 넣어 둔 음원은 그대로 써요. 인텔 Mac은 OpenUtau도 깔아요).
 2. 저장소의 Actions → 최근 빌드 → `EasyUtau-mac`을 받아 풀고 `EasyUtau.app`을 응용 프로그램 폴더로 옮겨요
    (Apple Silicon · 인텔 모두 돼요, macOS 14 이상).
 3. 서명 없는 앱이라 처음 한 번은 막혀요. 터미널에 이렇게 한 번만 실행해요:
@@ -28,7 +30,7 @@ EasyUtau는 소리를 스스로 만들지 않아요. 내 Mac에 깔린 **OpenUta
    xattr -dr com.apple.quarantine /Applications/EasyUtau.app
    ```
 
-직접 만들려면 `mac/build.sh --install` (Xcode 또는 Command Line Tools + .NET SDK 10 필요).
+직접 만들려면 `mac/build.sh --install` (Xcode 또는 Command Line Tools + .NET SDK 10, 그리고 엔진 재료로 OpenUtau.app 필요).
 
 ## 쓰는 법
 
@@ -89,7 +91,7 @@ EasyUtau는 소리를 스스로 만들지 않아요. 내 Mac에 깔린 **OpenUta
 | --- | --- |
 | `engine/` | C# 엔진. OpenUtau.Core를 그대로 쓰면서 앱과 표준 입출력으로 JSON 한 줄씩 주고받아요 (열기 · 고치기 · 되돌리기 · 재생 · 내보내기). |
 | `mac/Sources/EasyUtau/` | SwiftUI · AppKit 앱. 악보(`PianoRoll.swift`)와 트랙 화면(`TracksView.swift`)은 빠르게 돌도록 직접 그려요. |
-| `devtools/` | CI와 손 시험용 도구 (엔진 폴더 준비, 엔진 시험, 음원 설치). |
+| `devtools/` | CI와 손 시험용 도구 (앱에 넣을 엔진 만들기 `bundle_engine.py`, 엔진 시험, 예전 방식과 성능 비교 `engine_bench.py`, 음원 설치). |
 | `.github/workflows/mac.yml` | macOS에서 앱을 만들고, 실제 음원으로 엔진을 시험해요 (소리 파일은 올리지 않아요). |
 
 음 높이 계산(`Pitch.swift`)은 OpenUtau의 식을 그대로 옮겨서, 화면의 주황색 선이 실제로 부르는 높이와 같아요.

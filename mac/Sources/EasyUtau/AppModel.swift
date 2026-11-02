@@ -71,7 +71,7 @@ final class AppModel: ObservableObject {
     }
 
     private func boot() async {
-        engineState = .starting("OpenUtau를 찾는 중…")
+        engineState = .starting("엔진을 준비하는 중…")
         let host: URL
         do {
             host = try await Task.detached { try Engine.prepare() }.value
@@ -451,11 +451,16 @@ final class AppModel: ObservableObject {
         autoTunerResults = files.sorted { date($0) > date($1) }
     }
 
-    /// 끌어다 놓은 파일: 프로젝트면 열고, 소리 파일이면 트랙으로 넣는다.
+    /// 가수 음원 묶음 (OpenUtau 가수 설치가 받는 것과 같은 종류)
+    static let voicebankExtensions = ["zip", "rar", "7z", "uar", "vogeon", "oudep"]
+
+    /// 끌어다 놓은 파일: 프로젝트면 열고, 음원 묶음이면 가수로 넣고, 소리 파일이면 트랙으로 넣는다.
     func useDroppedFile(_ url: URL) {
         let ext = url.pathExtension.lowercased()
         if ["ustx", "ust", "vsqx", "mid", "midi", "musicxml", "ufdata"].contains(ext) {
             open(url)
+        } else if Self.voicebankExtensions.contains(ext) {
+            installSinger(url)
         } else {
             addAudio(url)
         }
@@ -743,6 +748,30 @@ final class AppModel: ObservableObject {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/OpenUtau/Singers")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
+    }
+
+    /// 가수 음원(zip 등) 고르기 → 가수 폴더에 넣기
+    func installSingerPanel() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = Self.voicebankExtensions.compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = false
+        panel.message = "넣을 가수 음원 묶음(zip 등)을 골라 주세요. OpenUtau 가수 폴더에 풀어요."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        installSinger(url)
+    }
+
+    func installSinger(_ url: URL) {
+        guard isReady else {
+            show("엔진이 켜진 뒤에 다시 넣어 주세요", success: false)
+            return
+        }
+        Task {
+            guard let reply = await command("installSinger", ["path": url.path], busy: "가수 음원을 넣는 중…") else { return }
+            if let s = try? Engine.decode([SingerInfo].self, reply["singers"]) { singers = s }
+            let added = reply["added"] as? [String] ?? []
+            show(added.isEmpty ? "넣었어요 (새로 찾은 가수는 없어요)" : "가수를 넣었어요: " + added.joined(separator: ", "),
+                 success: !added.isEmpty)
+        }
     }
 
     func refreshSingers() {
