@@ -54,7 +54,7 @@ jobs:
           import json, sys
           b = json.load(open(sys.argv[1]))
           print(f"### 앱에 든 엔진\nOpenUtau 폴더 {b['openutau_bytes']/1e6:.1f} MB → {b['bundle_bytes']/1e6:.1f} MB, "
-                f"뺀 파일 {len(b['removed'])}개, 런타임 설정 {b['gc']} {b['gc_settings']}\n")
+                f"뺀 파일 {len(b['removed'])}개, .NET 설정 {b['gc']} {b['env']}\n")
           print("뺀 파일: " + ", ".join(b["removed"]))
           PY
           du -sh mac/build/EasyUtau.app
