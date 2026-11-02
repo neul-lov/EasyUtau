@@ -1,6 +1,7 @@
 """엔진을 켜고 앱이 하는 것과 같은 명령을 보내 본다 (소리는 내지 않고 파일로만 확인).
 
-사용: python devtools/engine_test.py <엔진 폴더 (engine_host.py가 만든 것)> [작업 폴더]
+사용: python devtools/engine_test.py <엔진 폴더 (engine_host.py · bundle_engine.py가 만든 것)> [작업 폴더] [가사,...]
+  EASYUTAU_TEST_INSTALL=<음원.zip>: 먼저 엔진으로 그 음원을 가수 폴더에 넣는다 (OpenUtau 없이 시험할 때)
 
 하는 것: 가수 찾기 → 새 프로젝트 → 섹터 넣기 → 발음 맞추기 → 되돌리기/다시 → 저장하고 다시 열기
 → wav로 내보내기(소리가 들어 있는지 확인) → 음 높이 곡선 · 떨림 · 발음 바꾸기.
@@ -22,6 +23,11 @@ class Engine:
         env = dict(os.environ)
         env["EASYUTAU_NO_AUDIO"] = "1"
         env["EASYUTAU_CACHE"] = str(work / "cache")
+        # 앱에 든 엔진이면 앱과 같은 .NET 설정을 넣는다 (이미 정한 값이 있으면 그것)
+        bundle = host / "BUNDLE.json"
+        if bundle.exists():
+            for k, v in json.loads(bundle.read_text(encoding="utf-8")).get("env", {}).items():
+                env.setdefault(k, str(v))
         self.proc = subprocess.Popen(
             [str(host / "EasyUtauEngine"), "EasyUtauEngine.dll"],
             cwd=str(host), env=env,
@@ -152,6 +158,14 @@ def main():
         print("엔진 준비됨:", json.dumps({k: ready.get(k) for k in ("openutau", "audio", "audioWarning")},
                                    ensure_ascii=False))
         result["openutau"] = ready.get("openutau")
+
+        # OpenUtau 없이: 가수 음원 zip을 엔진으로 넣기 (앱의 "가수 음원 넣기"와 같은 명령)
+        install = os.environ.get("EASYUTAU_TEST_INSTALL")
+        if install:
+            r = e.send("installSinger", path=str(Path(install).resolve()), timeout=900)
+            print(f"음원 넣기: 새 가수 {r['added']}, 이름 읽기 {r['encoding']}, 종류 {r['type']}")
+            assert r["added"], "음원을 넣었는데 새 가수가 없어요"
+            result["installed"] = r["added"]
 
         singers = e.send("singers")["singers"]
         found = [s for s in singers if s["found"]]

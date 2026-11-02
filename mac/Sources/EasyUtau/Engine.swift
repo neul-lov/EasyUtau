@@ -3,7 +3,11 @@ import Foundation
 
 /// EasyUtau 엔진(engine/, C#)을 켜고 명령을 주고받는다.
 ///
-/// 엔진은 사용자가 깔아 둔 OpenUtau를 그대로 쓴다: OpenUtau.app의 프로그램 폴더를 앱 데이터 폴더에 복사해 두고
+/// Apple Silicon Mac에서는 앱 안에 든 OpenUtau 엔진(Contents/Resources/engine/host)을 바로 쓴다:
+/// OpenUtau 0.1.576의 .NET 런타임 · OpenUtau.Core · 발음 방식 · worldline 그대로에서 화면용 파일만 뺀 것이라
+/// OpenUtau를 따로 깔지 않아도 되고, 가수 음원 · 설정은 여전히 OpenUtau와 같은 곳(~/Library/OpenUtau)을 쓴다.
+///
+/// 앱에 엔진이 없거나 인텔 Mac이면 예전처럼 사용자가 깔아 둔 OpenUtau를 그대로 쓴다: OpenUtau.app의 프로그램 폴더를 앱 데이터 폴더에 복사해 두고
 /// (APFS 복제라 자리를 거의 차지하지 않는다) OpenUtau.dll 자리에 EasyUtauEngine.dll을 넣어 돌린다.
 /// 그래서 OpenUtau에 깐 가수(테토 등) · 발음 방식 · 설정을 그대로 쓰고, OpenUtau 앱 자체는 건드리지 않는다.
 /// 실행 파일 이름은 EasyUtauEngine: OpenUtau는 같은 이름("OpenUtau")의 프로세스가 있으면 켜자마자 꺼져서,
@@ -17,7 +21,7 @@ final class Engine: @unchecked Sendable {
 
         var errorDescription: String? {
             switch self {
-            case .noOpenUtau: "OpenUtau를 찾지 못했어요. 응용 프로그램 폴더에 OpenUtau.app이 있어야 해요."
+            case .noOpenUtau: "OpenUtau를 찾지 못했어요. 인텔 Mac에서는 응용 프로그램 폴더에 OpenUtau.app이 있어야 해요."
             case .noEngine: "이 앱에 엔진이 들어 있지 않아요. 앱을 다시 받아 주세요."
             case .oldOpenUtau(let v): "OpenUtau가 너무 예전 버전이에요(\(v)). 최신 OpenUtau로 올려 주세요."
             case .message(let m): m
@@ -80,8 +84,23 @@ final class Engine: @unchecked Sendable {
 
     // MARK: 준비
 
-    /// 엔진을 돌릴 폴더를 준비한다 (OpenUtau나 엔진이 바뀌었을 때만 다시 복사).
+    /// 앱 안에 든 OpenUtau 엔진 폴더 (Apple Silicon용). EASYUTAU_USE_INSTALLED=1이면 깔린 OpenUtau를 쓴다.
+    static func bundledHost() -> URL? {
+#if arch(arm64)
+        if ProcessInfo.processInfo.environment["EASYUTAU_USE_INSTALLED"] == "1" { return nil }
+        guard let url = Bundle.main.resourceURL?.appendingPathComponent("engine/host", isDirectory: true) else { return nil }
+        let fm = FileManager.default
+        guard fm.isExecutableFile(atPath: url.appendingPathComponent(exeName).path),
+              fm.fileExists(atPath: url.appendingPathComponent("OpenUtau.Core.dll").path) else { return nil }
+        return url
+#else
+        return nil
+#endif
+    }
+
+    /// 엔진을 돌릴 폴더. 앱에 든 엔진이 있으면 그것, 없으면 깔린 OpenUtau를 복사해서 (OpenUtau나 엔진이 바뀌었을 때만 다시 복사).
     static func prepare() throws -> URL {
+        if let host = bundledHost() { return host }
         guard let src = openUtauDir() else { throw Failure.noOpenUtau }
         guard let dll = engineDLL() else { throw Failure.noEngine }
         let fm = FileManager.default
@@ -169,6 +188,15 @@ final class Engine: @unchecked Sendable {
         return p.terminationStatus
     }
 
+    static func bundleEnv(_ host: URL) -> [String: String] {
+        guard let data = try? Data(contentsOf: host.appendingPathComponent("BUNDLE.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = obj["env"] as? [String: Any] else { return [:] }
+        var out: [String: String] = [:]
+        for (k, v) in env where k.hasPrefix("DOTNET_") { out[k] = "\(v)" }
+        return out
+    }
+
     // MARK: 켜기 · 주고받기
 
     private var process: Process?
@@ -201,6 +229,8 @@ final class Engine: @unchecked Sendable {
         env["EASYUTAU_CACHE"] = Self.cacheDir.path
         env["EASYUTAU_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         env["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
+        // 앱에 든 엔진: 만들 때 고른 .NET 메모리 · CPU 설정 (BUNDLE.json "env", 이미 정한 값이 있으면 그것)
+        for (k, v) in Self.bundleEnv(host) where env[k] == nil { env[k] = v }
         p.environment = env
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         p.standardInput = stdin

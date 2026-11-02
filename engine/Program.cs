@@ -37,12 +37,18 @@ namespace EasyUtau.Engine {
 
         public override int MaximumConcurrencyLevel => 1;
 
-        /// <summary>일이 없을 때는 tick마다 idle을 부른다 (재생 위치 알리기 등). 끝날 때까지 돌아오지 않는다.</summary>
-        public void Run(Action idle, int tickMs) {
+        /// <summary>
+        /// 일이 없을 때 idle을 부른다 (재생 위치 알리기 등). 끝날 때까지 돌아오지 않는다.
+        /// 재생 중이거나 알릴 것이 있으면(active) tickMs마다, 아무 일도 없으면 restMs마다만 깬다
+        /// (쉬는 동안 1초에 33번씩 깨어 CPU를 쓰지 않게). 명령이 오면 바로 깬다.
+        /// </summary>
+        public void Run(Action idle, Func<bool> active, int tickMs, int restMs) {
             thread = Thread.CurrentThread;
             var last = DateTime.UtcNow;
             while (true) {
-                if (queue.TryTake(out var action, tickMs)) {
+                int period = Active(active) ? tickMs : restMs;
+                int remain = (int)Math.Max(0, period - (DateTime.UtcNow - last).TotalMilliseconds);
+                if (queue.TryTake(out var action, remain)) {
                     try {
                         action();
                     } catch (Exception e) {
@@ -50,7 +56,8 @@ namespace EasyUtau.Engine {
                         Protocol.Event("error", new JsonObject { ["message"] = Protocol.Describe(e) });
                     }
                 }
-                if ((DateTime.UtcNow - last).TotalMilliseconds >= tickMs) {
+                period = Active(active) ? tickMs : restMs;
+                if ((DateTime.UtcNow - last).TotalMilliseconds >= period) {
                     last = DateTime.UtcNow;
                     try {
                         idle();
@@ -58,6 +65,14 @@ namespace EasyUtau.Engine {
                         Log.Warning(e, "idle");
                     }
                 }
+            }
+        }
+
+        static bool Active(Func<bool> active) {
+            try {
+                return active();
+            } catch (Exception) {
+                return true;
             }
         }
     }
@@ -116,6 +131,9 @@ namespace EasyUtau.Engine {
         public static MainLoop Loop { get; private set; }
 
         static int Main(string[] args) {
+            if (Array.IndexOf(args, "--closure") >= 0) {
+                return Closure.Print();
+            }
             Protocol.Init();
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
             Log.Logger = new LoggerConfiguration()
@@ -141,8 +159,14 @@ namespace EasyUtau.Engine {
             WatchParent();
             var reader = new Thread(() => ReadCommands(session)) { IsBackground = true, Name = "stdin" };
             reader.Start();
-            Loop.Run(session.Idle, 30);
+            Loop.Run(session.Idle, session.Active, 30, RestMs());
             return 0;
+        }
+
+        /// <summary>쉴 때 깨는 간격 (EASYUTAU_REST_MS로 바꿀 수 있다: 비교 시험용).</summary>
+        static int RestMs() {
+            var text = Environment.GetEnvironmentVariable("EASYUTAU_REST_MS");
+            return int.TryParse(text, out var ms) && ms >= 10 ? ms : 250;
         }
 
         /// <summary>렌더 캐시는 EasyUtau 전용 폴더로: OpenUtau가 같이 켜져 있어도 서로의 캐시를 지우지 않게.</summary>
