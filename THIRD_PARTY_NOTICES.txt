@@ -3,10 +3,25 @@ EasyUtau third-party notices
 
 EasyUtau's own code is under the MIT License (see LICENSE).
 
-EasyUtau does not bundle OpenUtau. Its engine (engine/EasyUtauEngine.dll) is built against
-OpenUtau.Core from the copy of OpenUtau that the user installed, and runs inside a copy of that
-installation's folder, so OpenUtau's own license applies to those files. Parts of EasyUtau's pitch
-and curve math (Swift) and of the engine are ports of OpenUtau code (MIT). Its notice follows.
+On Apple Silicon Macs, EasyUtau bundles the engine part of OpenUtau 0.1.576 (macOS arm64 release,
+https://github.com/stakira/OpenUtau/releases/tag/0.1.576) in EasyUtau.app/Contents/Resources/engine/host:
+the .NET runtime, OpenUtau.Core, OpenUtau.Plugin.Builtin, the worldline native library and the other
+libraries OpenUtau.Core uses, unmodified. Only the files used by the user interface were left out
+(the list is in engine/host/BUNDLE.json). EasyUtauEngine.dll is placed where OpenUtau.dll was.
+On Intel Macs the engine runs inside a copy of the user's own OpenUtau installation instead.
+
+These bundled files keep their own licenses:
+- OpenUtau, OpenUtau.Core, OpenUtau.Plugin.Builtin, worldline: MIT (notice below). worldline uses
+  WORLD (https://github.com/mmorise/World, modified BSD license).
+- .NET runtime (https://github.com/dotnet/runtime): MIT.
+- NuGet libraries used by OpenUtau.Core (Serilog, NAudio, SharpCompress, YamlDotNet, Jint, NumSharp,
+  NWaves, Melanchall.DryWetMidi, NetMQ, Microsoft.ML.OnnxRuntime, SDL3-CS and others, see
+  https://github.com/stakira/OpenUtau/blob/0.1.576/OpenUtau.Core/OpenUtau.Core.csproj): each under the
+  license on its NuGet page (https://www.nuget.org/packages/<name>). NetMQ is LGPL-3.0: it is included
+  as the unmodified NetMQ.dll and can be replaced with another build of the same version.
+
+Parts of EasyUtau's pitch and curve math (Swift) and of the engine are ports of OpenUtau code (MIT).
+Its notice follows.
 
 ----------------------------------------------------------------------
 OpenUtau (https://github.com/stakira/OpenUtau)

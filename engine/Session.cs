@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using OpenUtau.Api;
+using OpenUtau.Classic;
 using OpenUtau.Core;
 using OpenUtau.Core.Format;
 using OpenUtau.Core.Render;
@@ -142,7 +143,13 @@ namespace EasyUtau.Engine {
             }
         }
 
-        /// <summary>일이 없을 때마다 (30ms): 재생 위치 · 음소가 새로 나온 파트를 알린다.</summary>
+        /// <summary>바로바로 알릴 것이 있는지: 재생 중 · 재생 준비 중 · 막 멈춤 · 음소가 새로 나온 파트.</summary>
+        public bool Active() {
+            var pm = PlaybackManager.Inst;
+            return wasPlaying || pm.PlayingMaster || pm.StartingToPlay || phonemized.Count > 0;
+        }
+
+        /// <summary>일이 없을 때마다 (재생 중엔 30ms, 쉴 때는 더 드물게): 재생 위치 · 음소가 새로 나온 파트를 알린다.</summary>
         public void Idle() {
             var pm = PlaybackManager.Inst;
             bool playing = pm.PlayingMaster;
@@ -381,6 +388,8 @@ namespace EasyUtau.Engine {
                     return Otos(req);
                 case "export":
                     return Export(req);
+                case "installSinger":
+                    return InstallSinger(req);
                 default:
                     throw new InvalidOperationException("모르는 명령이에요: " + cmd);
             }
@@ -800,6 +809,42 @@ namespace EasyUtau.Engine {
                         : new JsonObject { ["ok"] = false, ["error"] = errors.Count > 0 ? errors[0] : "내보내지 못했어요" });
                 }));
             }, 60);
+            return new JsonObject { ["_async"] = true };
+        }
+
+        /// <summary>가수 음원(zip 등)을 가수 폴더에 넣고 가수 목록을 다시 읽는다. 끝나면 답한다.</summary>
+        JsonObject InstallSinger(JsonObject req) {
+            var path = Str(req, "path");
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) {
+                throw new InvalidOperationException("음원 파일을 찾지 못했어요");
+            }
+            var id = req["id"]?.DeepClone();
+            var archiveEncoding = Voicebanks.ZipNamesAreUtf8(path) ? Encoding.UTF8 : Voicebanks.ShiftJis;
+            var singerType = Voicebanks.SingerType(path);
+            var basePath = PathManager.Inst.SingersInstallPath;
+            var before = new HashSet<string>(SingerManager.Inst.Singers.Keys);
+            Task.Run(() => {
+                var installer = new VoicebankInstaller(basePath, (value, info) => Program.Loop.Post(() =>
+                    DocManager.Inst.ExecuteCmd(new ProgressBarNotification(value, info))), archiveEncoding, Voicebanks.ShiftJis);
+                installer.Install(path, singerType);
+            }).ContinueWith(t => Program.Loop.Post(() => {
+                DocManager.Inst.ExecuteCmd(new ProgressBarNotification(0, ""));
+                if (t.IsFaulted) {
+                    Reply(id, new JsonObject { ["ok"] = false, ["error"] = "음원을 넣지 못했어요: " + Protocol.Describe(t.Exception) });
+                    return;
+                }
+                SingerManager.Inst.SearchAllSingers();
+                DocManager.Inst.ExecuteCmd(new SingersRefreshedNotification());
+                var added = SingerManager.Inst.Singers.Values.Where(s => !before.Contains(s.Id)).Select(s => s.LocalizedName ?? s.Name ?? "").ToList();
+                Reply(id, new JsonObject {
+                    ["ok"] = true,
+                    ["added"] = Json.Array(added, n => (JsonNode)JsonValue.Create(n)),
+                    ["encoding"] = archiveEncoding.WebName,
+                    ["type"] = singerType,
+                    ["singers"] = Singers(),
+                    ["project"] = ProjectJson(),
+                });
+            }));
             return new JsonObject { ["_async"] = true };
         }
 

@@ -1,8 +1,11 @@
 #!/bin/zsh
 # EasyUtau.app을 ./build에 만든다. --install을 붙이면 /Applications에도 넣는다.
 #
-# 앱에는 엔진(EasyUtauEngine.dll)이 들어간다. 엔진은 Mac에 설치된 OpenUtau의 OpenUtau.Core.dll을
-# 참조해서 돌기 때문에, 빌드할 때도 OpenUtau가 있어야 한다 (EASYUTAU_OPENUTAU로 다른 곳을 가리킬 수 있다).
+# 앱에는 엔진이 들어간다: OpenUtau(Apple Silicon 판)의 런타임 · OpenUtau.Core에서 화면용 파일을 뺀 폴더
+# (Contents/Resources/engine/host, devtools/bundle_engine.py)라서 쓰는 사람은 OpenUtau를 따로 깔 필요가 없다.
+# 빌드할 때는 그 재료로 OpenUtau가 있어야 한다 (EASYUTAU_OPENUTAU로 다른 곳을 가리킬 수 있다. CI는 0.1.576).
+# 인텔 Mac용으로 EasyUtauEngine.dll도 따로 넣는다 (그때는 깔린 OpenUtau를 쓴다).
+# EASYUTAU_GC: 엔진 런타임 설정 묶음 (bundle_engine.py의 GC_PRESETS)
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
@@ -34,6 +37,9 @@ lipo -archs "$APP/Contents/MacOS/EasyUtau"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.txt" "$APP/Contents/Resources/"
 cp build/engine/EasyUtauEngine.dll "$APP/Contents/Resources/engine/"
+# OpenUtau 엔진을 앱 안에 (화면용 파일은 빼고)
+python3 "$ROOT/devtools/bundle_engine.py" "$OUDIR" build/engine/EasyUtauEngine.dll \
+    "$APP/Contents/Resources/engine/host" --gc "${EASYUTAU_GC:-lean}"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
